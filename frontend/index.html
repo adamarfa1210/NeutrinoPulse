@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeutrinoPulse v2.0 — QNX 8.0 Real-Time Telemetry & AI Copilot</title>
+  <link rel="icon" href="data:," />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    @keyframes pulse-border {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+      50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+    }
+    .anomaly-pulse { animation: pulse-border 1.5s infinite; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div class="max-w-7xl mx-auto px-4 py-4 space-y-4">
+
+    <!-- Header -->
+    <header class="flex flex-wrap items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 rounded-xl px-5 py-3.5">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-lg bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center text-cyan-400 font-bold text-lg">
+          NP
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-lg font-bold tracking-tight text-white">NeutrinoPulse <span class="text-cyan-400 text-sm font-semibold">v2.0</span></h1>
+            <span id="ws-badge" class="inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+              <span id="ws-dot" class="w-2 h-2 rounded-full bg-slate-500"></span>
+              <span id="ws-text">Connecting...</span>
+            </span>
+          </div>
+          <p class="text-xs text-slate-400">QNX Neutrino RTOS 8.0 • Core 0 (Workload) / Core 1 (np_agent) • UDP Binary Telemetry</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2.5">
+        <span id="ai-status-pill" class="hidden sm:inline-flex items-center text-xs px-2.5 py-1 rounded-lg bg-slate-800 border border-slate-700 text-slate-300">
+          AI: Checking...
+        </span>
+        <button id="btn-reset" onclick="resetTelemetry()" class="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
+          Reset
+        </button>
+        <button id="btn-diagnose" onclick="runDiagnosis()" class="px-4 py-1.5 text-xs font-semibold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white transition flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+          <span id="diag-spinner" class="hidden w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+          <span id="diag-btn-text">Diagnose with AI</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- KPI Cards -->
+    <section class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 uppercase tracking-wider">Target PID</div>
+        <div id="kpi-pid" class="text-2xl font-bold text-white mt-1 font-mono">—</div>
+        <div id="kpi-packets" class="text-xs text-slate-500 mt-1">0 packets received</div>
+      </div>
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 uppercase tracking-wider">Peak IPC Latency</div>
+        <div id="kpi-peak" class="text-2xl font-bold text-cyan-400 mt-1 font-mono">0 µs</div>
+        <div class="text-xs text-slate-500 mt-1">Real-time budget: &lt; 10,000 µs</div>
+      </div>
+      <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+        <div class="text-xs text-slate-400 uppercase tracking-wider">Active Threads</div>
+        <div id="kpi-threads" class="text-2xl font-bold text-white mt-1 font-mono">0</div>
+        <div class="text-xs text-slate-500 mt-1">Core 0 / Core 1 isolated</div>
+      </div>
+      <div id="kpi-health-card" class="bg-slate-900/80 border border-slate-800 rounded-xl p-4 transition-colors">
+        <div class="text-xs text-slate-400 uppercase tracking-wider">System Health</div>
+        <div id="kpi-health" class="text-xl font-bold text-emerald-400 mt-1">IDLE / HEALTHY</div>
+        <div id="kpi-anomaly-count" class="text-xs text-slate-500 mt-1">0 anomaly events</div>
+      </div>
+    </section>
+
+    <!-- Main 2-Column Layout -->
+    <main class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+      <!-- Left: Chart + Threads Table -->
+      <div class="lg:col-span-7 space-y-4">
+        <!-- Chart -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div>
+              <h2 class="text-sm font-semibold text-white">Live MsgSend() Round-Trip Latency (µs)</h2>
+              <p class="text-xs text-slate-400">Measured via ClockCycles() probe + shared-memory ring</p>
+            </div>
+            <span class="text-xs text-rose-400 font-mono">Threshold: 10,000 µs</span>
+          </div>
+          <div class="h-56">
+            <canvas id="latencyChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Thread Table -->
+        <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-sm font-semibold text-white">QNX Target Threads (/proc/&lt;pid&gt;/as)</h2>
+            <span class="text-xs text-slate-400">100ms polling cadence on CPU Core 1</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="text-slate-400 border-b border-slate-800">
+                <tr>
+                  <th class="py-2 pr-3">TID</th>
+                  <th class="py-2 px-3">Priority</th>
+                  <th class="py-2 px-3">Kernel State</th>
+                  <th class="py-2 px-3">Streak</th>
+                  <th class="py-2 px-3">Latency</th>
+                  <th class="py-2 pl-3">Caller IP</th>
+                </tr>
+              </thead>
+              <tbody id="threads-tbody" class="divide-y divide-slate-800/70 font-mono">
+                <tr>
+                  <td colspan="6" class="py-6 text-center text-slate-500 font-sans">
+                    Menunggu stream UDP dari QNX QEMU (port 9999)...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: AI Copilot & Live Diff View -->
+      <div class="lg:col-span-5">
+        <div class="bg-slate-900/80 border border-slate-800 rounded-xl p-4 h-full flex flex-col justify-between space-y-4">
+          <div class="space-y-3">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div>
+                <h2 class="text-sm font-semibold text-white">AI Root-Cause Copilot</h2>
+                <p class="text-xs text-slate-400">ntox86_64-addr2line + Gemini Reasoning + Live Code Diff</p>
+              </div>
+              <span id="diag-provider" class="hidden text-[11px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono"></span>
+            </div>
+
+            <!-- Empty / Alert Prompt State -->
+            <div id="diag-empty" class="rounded-lg border border-dashed border-slate-700 bg-slate-950/50 p-5 text-center space-y-2">
+              <div id="diag-empty-title" class="text-sm font-medium text-slate-300">Belum ada diagnosis AI</div>
+              <p id="diag-empty-desc" class="text-xs text-slate-400">
+                Jalankan <code class="text-cyan-300">brake_sim_buggy</code> di QNX QEMU. Saat anomali latensi IPC terdeteksi, klik <strong class="text-white">Diagnose with AI</strong> untuk melihat akar masalah dan saran perbaikan kode.
+              </p>
+            </div>
+
+            <!-- Active Diagnosis Result -->
+            <div id="diag-result" class="hidden space-y-3">
+              <div class="flex items-start justify-between gap-2">
+                <div>
+                  <span id="diag-severity" class="inline-block text-[11px] font-bold px-2 py-0.5 rounded uppercase tracking-wide mb-1">CRITICAL</span>
+                  <h3 id="diag-root-cause" class="text-sm font-bold text-white leading-snug"></h3>
+                </div>
+              </div>
+
+              <div class="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5 text-xs">
+                <div class="text-slate-400">Lokasi Terpetakan (<span class="font-mono text-cyan-400">addr2line</span> &amp; Server):</div>
+                <div id="diag-location" class="font-mono text-amber-300 break-all"></div>
+                <div id="diag-symbol" class="font-mono text-slate-400 text-[11px] break-all"></div>
+              </div>
+
+              <div class="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1">
+                <div class="text-xs font-semibold text-slate-300">Penjelasan Arsitektur QNX:</div>
+                <p id="diag-explanation" class="text-xs text-slate-300 leading-relaxed"></p>
+              </div>
+
+              <!-- Live Source-Code Diff View -->
+              <div class="border border-slate-800 rounded-lg overflow-hidden">
+                <div class="bg-slate-800/80 px-3 py-1.5 text-xs font-semibold text-slate-200 flex items-center justify-between">
+                  <span>Live Source-Code Diff Patch</span>
+                  <span class="text-[11px] text-slate-400 font-mono">QNX 8.0 Fix</span>
+                </div>
+                <div class="bg-rose-950/40 border-b border-slate-800 px-3 py-2 font-mono text-xs text-rose-300 overflow-x-auto">
+                  <pre id="diag-before" class="whitespace-pre-wrap"></pre>
+                </div>
+                <div class="bg-emerald-950/40 px-3 py-2 font-mono text-xs text-emerald-300 overflow-x-auto">
+                  <pre id="diag-after" class="whitespace-pre-wrap"></pre>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="diag-error" class="hidden rounded-lg bg-rose-950/50 border border-rose-500/40 p-3 text-xs text-rose-200"></div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <script>
+    const STATE_COLORS = {
+      RUNNING: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
+      READY: "bg-sky-500/15 text-sky-300 border-sky-500/30",
+      STATE_REPLY: "bg-rose-500/20 text-rose-300 border-rose-500/40",
+      STATE_MUTEX: "bg-amber-500/20 text-amber-300 border-amber-500/40",
+      RECEIVE: "bg-indigo-500/15 text-indigo-300 border-indigo-500/30",
+      NANOSLEEP: "bg-slate-800 text-slate-400 border-slate-700"
+    };
+
+    // Initialize Chart.js
+    const ctx = document.getElementById("latencyChart").getContext("2d");
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [
+          {
+            label: "IPC Latency (µs)",
+            data: [],
+            borderColor: "#22d3ee",
+            backgroundColor: "rgba(34, 211, 238, 0.12)",
+            borderWidth: 2,
+            tension: 0.25,
+            fill: true,
+            pointRadius: 3,
+            pointBackgroundColor: []
+          },
+          {
+            label: "Budget Threshold (10,000 µs)",
+            data: [],
+            borderColor: "rgba(244, 63, 94, 0.7)",
+            borderDash: [5, 5],
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+          x: { display: false },
+          y: {
+            beginAtZero: true,
+            grid: { color: "rgba(148, 163, 184, 0.1)" },
+            ticks: { color: "#94a3b8", font: { size: 11 } }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: "#cbd5e1", boxWidth: 12, font: { size: 11 } } }
+        }
+      }
+    });
+
+    async function checkHealth() {
+      try {
+        const res = await fetch("/api/health");
+        const data = await res.json();
+        const pill = document.getElementById("ai-status-pill");
+        if (data.gemini_configured) {
+          pill.textContent = "AI: Gemini Connected";
+          pill.className = "hidden sm:inline-flex items-center text-xs px-2.5 py-1 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300";
+        } else {
+          pill.textContent = `AI: ${data.llm_provider} (Fallback)`;
+        }
+      } catch (_) {}
+    }
+
+    function renderSnapshot(s) {
+      document.getElementById("kpi-pid").textContent = s.active_pid ? s.active_pid : "—";
+      document.getElementById("kpi-packets").textContent = `${s.total_packets.toLocaleString()} packets received`;
+      document.getElementById("kpi-threads").textContent = s.threads.length;
+      document.getElementById("kpi-anomaly-count").textContent = `${s.anomaly_count} anomaly events`;
+
+      const peakEl = document.getElementById("kpi-peak");
+      peakEl.textContent = `${s.peak_latency_us.toLocaleString()} µs`;
+      peakEl.className = s.peak_latency_us > 10000
+        ? "text-2xl font-bold text-rose-400 mt-1 font-mono"
+        : "text-2xl font-bold text-cyan-400 mt-1 font-mono";
+
+      const healthCard = document.getElementById("kpi-health-card");
+      const healthEl = document.getElementById("kpi-health");
+      const diagBtn = document.getElementById("btn-diagnose");
+
+      if (s.is_anomaly) {
+        healthEl.textContent = "ANOMALY DETECTED";
+        healthEl.className = "text-xl font-bold text-rose-400 mt-1";
+        healthCard.className = "bg-rose-950/30 border border-rose-500/50 rounded-xl p-4 anomaly-pulse";
+        diagBtn.className = "px-4 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white transition flex items-center gap-2 anomaly-pulse";
+        if (s.last_anomaly) {
+          document.getElementById("diag-empty-title").textContent = `Anomali Terdeteksi (${s.last_anomaly.latency_us.toLocaleString()} µs)!`;
+          document.getElementById("diag-empty-title").className = "text-sm font-semibold text-rose-300";
+        }
+      } else if (s.total_packets > 0) {
+        healthEl.textContent = "HEALTHY (REAL-TIME)";
+        healthEl.className = "text-xl font-bold text-emerald-400 mt-1";
+        healthCard.className = "bg-emerald-950/20 border border-emerald-500/30 rounded-xl p-4";
+        diagBtn.className = "px-4 py-1.5 text-xs font-semibold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white transition flex items-center gap-2";
+      } else {
+        healthEl.textContent = "IDLE / WAITING";
+        healthEl.className = "text-xl font-bold text-slate-300 mt-1";
+        healthCard.className = "bg-slate-900/80 border border-slate-800 rounded-xl p-4";
+      }
+
+      // Update Chart (last 60 points)
+      const hist = (s.history || []).slice(-60);
+      chart.data.labels = hist.map((_, i) => i + 1);
+      chart.data.datasets[0].data = hist.map(h => h.latency_us);
+      chart.data.datasets[0].pointBackgroundColor = hist.map(h => h.is_anomaly ? "#f43f5e" : "#22d3ee");
+      chart.data.datasets[1].data = hist.map(() => 10000);
+      chart.update();
+
+      // Update Thread Table
+      const tbody = document.getElementById("threads-tbody");
+      if (!s.threads.length) {
+        tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-slate-500 font-sans">Menunggu stream UDP dari QNX QEMU (port 9999)...</td></tr>`;
+      } else {
+        tbody.innerHTML = s.threads.map(t => {
+          const badgeCls = STATE_COLORS[t.state_name] || "bg-slate-800 text-slate-300 border-slate-700";
+          const latCls = t.latency_us > 10000 ? "text-rose-400 font-bold" : "text-slate-200";
+          return `
+            <tr class="hover:bg-slate-800/40">
+              <td class="py-2 pr-3 text-white font-semibold">${t.tid}</td>
+              <td class="py-2 px-3">${t.priority}</td>
+              <td class="py-2 px-3"><span class="px-2 py-0.5 rounded border text-[11px] ${badgeCls}">${t.state_name}</span></td>
+              <td class="py-2 px-3">${t.blocked_streak}</td>
+              <td class="py-2 px-3 ${latCls}">${t.latency_us.toLocaleString()} µs</td>
+              <td class="py-2 pl-3 text-cyan-300">${t.ip_hex}</td>
+            </tr>
+          `;
+        }).join("");
+      }
+    }
+
+    function connectWS() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/ws/telemetry`);
+      const badge = document.getElementById("ws-badge");
+      const dot = document.getElementById("ws-dot");
+      const txt = document.getElementById("ws-text");
+
+      ws.onopen = () => {
+        badge.className = "inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30";
+        dot.className = "w-2 h-2 rounded-full bg-emerald-400";
+        txt.textContent = "Live";
+      };
+      ws.onmessage = (ev) => {
+        try {
+          renderSnapshot(JSON.parse(ev.data));
+        } catch (_) {}
+      };
+      ws.onclose = () => {
+        badge.className = "inline-flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-300 border border-rose-500/30";
+        dot.className = "w-2 h-2 rounded-full bg-rose-400";
+        txt.textContent = "Reconnecting...";
+        setTimeout(connectWS, 1500);
+      };
+    }
+
+    async function runDiagnosis() {
+      const btn = document.getElementById("btn-diagnose");
+      const spinner = document.getElementById("diag-spinner");
+      const btnText = document.getElementById("diag-btn-text");
+      const errBox = document.getElementById("diag-error");
+
+      errBox.classList.add("hidden");
+      btn.disabled = true;
+      spinner.classList.remove("hidden");
+      btnText.textContent = "Analyzing...";
+
+      try {
+        const res = await fetch("/api/diagnose", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({})
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Diagnosis failed");
+
+        const d = data.diagnosis;
+        const sym = data.symbol_resolution || {};
+
+        document.getElementById("diag-empty").classList.add("hidden");
+        document.getElementById("diag-result").classList.remove("hidden");
+
+        const provEl = document.getElementById("diag-provider");
+        provEl.textContent = d.provider || "ai";
+        provEl.classList.remove("hidden");
+
+        const sevEl = document.getElementById("diag-severity");
+        sevEl.textContent = d.severity || "CRITICAL";
+        sevEl.className = d.severity === "CRITICAL"
+          ? "inline-block text-[11px] font-bold px-2 py-0.5 rounded uppercase tracking-wide mb-1 bg-rose-500/20 text-rose-300 border border-rose-500/40"
+          : "inline-block text-[11px] font-bold px-2 py-0.5 rounded uppercase tracking-wide mb-1 bg-amber-500/20 text-amber-300 border border-amber-500/40";
+
+        document.getElementById("diag-root-cause").textContent = d.root_cause || "Unknown issue";
+        document.getElementById("diag-location").textContent = d.file_location || "—";
+        document.getElementById("diag-symbol").textContent = sym.resolved
+          ? `Client call site: ${sym.function}() @ ${sym.file}:${sym.line} (${sym.ip_hex})`
+          : "";
+        document.getElementById("diag-explanation").textContent = d.qnx_explanation || "";
+
+        const formatLines = (prefix, code) =>
+          (code || "").split("\n").map(line => `${prefix} ${line}`).join("\n");
+        document.getElementById("diag-before").textContent = formatLines("-", d.code_before);
+        document.getElementById("diag-after").textContent = formatLines("+", d.code_after);
+      } catch (err) {
+        errBox.textContent = `Error: ${err.message}`;
+        errBox.classList.remove("hidden");
+      } finally {
+        btn.disabled = false;
+        spinner.classList.add("hidden");
+        btnText.textContent = "Diagnose with AI";
+      }
+    }
+
+    async function resetTelemetry() {
+      await fetch("/api/reset", { method: "POST" });
+      document.getElementById("diag-result").classList.add("hidden");
+      document.getElementById("diag-empty").classList.remove("hidden");
+      document.getElementById("diag-provider").classList.add("hidden");
+      document.getElementById("diag-error").classList.add("hidden");
+      document.getElementById("diag-empty-title").textContent = "Belum ada diagnosis AI";
+      document.getElementById("diag-empty-title").className = "text-sm font-medium text-slate-300";
+      const res = await fetch("/api/state");
+      renderSnapshot(await res.json());
+    }
+
+    checkHealth();
+    connectWS();
+  </script>
+</body>
+</html>

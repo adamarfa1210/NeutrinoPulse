@@ -1,0 +1,23 @@
+# Secrets & environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Compiled QNX binaries (rebuilt from source via make)
+target/np_agent
+target/brake_sim_buggy
+target/brake_sim_fixed
+hello_qnx/hello
+hello_qnx/hello_arm64
+hello_qnx/udp_test
+
+# VM / OS artifacts & logs
+*.qcow2
+*.vmdk
+*.img
+*.log
