@@ -1,5 +1,6 @@
 """Hybrid AI Copilot engine: Gemini API, optional local LM Studio, and safe QNX fallback."""
 
+import asyncio
 import json
 import os
 import re
@@ -9,14 +10,17 @@ import httpx
 
 SYSTEM_INSTRUCTION = (
     "You are a senior QNX Neutrino RTOS 8.0 systems engineer. "
-    "Analyze the runtime IPC/thread anomaly and the resolved C source snippets (client MsgSend call site and server ChannelCreate setup). "
+    "Analyze the runtime IPC/thread snapshot and the resolved C/C++ source snippets (client call site and server ChannelCreate setup). "
+    "Distinguish active C/C++ statements from comments, and pay close attention to measured latency vs the 10,000 us real-time budget. "
+    "If active ChannelCreate(0) is already used and measured latency is <= 10,000 us with no blocking anomaly, respond with severity \"HEALTHY\", "
+    "explain that Priority Inheritance is active and latency is healthy, and set code_before/code_after to \"// No change needed\". "
     "Respond ONLY with a valid JSON object containing exact keys: "
     "\"root_cause\" (short title), "
     "\"severity\" (CRITICAL | WARNING | HEALTHY), "
-    "\"qnx_explanation\" (clear technical explanation referencing QNX microkernel behavior such as Priority Inheritance or _NTO_CHF_FIXED_PRIORITY), "
+    "\"qnx_explanation\" (clear technical explanation referencing QNX microkernel behavior), "
     "\"file_location\" (exact file and line), "
-    "\"code_before\" (the exact buggy C line/block), "
-    "\"code_after\" (the exact fixed C line/block)."
+    "\"code_before\" (the exact buggy C/C++ line or \"// No change needed\"), "
+    "\"code_after\" (the exact fixed C/C++ line or \"// ChannelCreate(0) priority inheritance already enabled\")."
 )
 
 
@@ -46,12 +50,23 @@ def _build_prompt(anomaly: dict[str, Any], context: dict[str, Any]) -> str:
     )
 
 
+def _has_active_fixed_priority_flag(snippet: str) -> bool:
+    for ln in snippet.splitlines():
+        code_part = ln.split("|", 1)[-1].strip()
+        if code_part.startswith(("*", "//", "/*")):
+            continue
+        if "_NTO_CHF_FIXED_PRIORITY" in code_part:
+            return True
+    return False
+
+
 def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note: str) -> dict[str, Any]:
     """Deterministic QNX diagnostic fallback if no API key is configured or offline."""
     res = context.get("client_resolution", {})
     client_loc = f"{res.get('file', 'unknown')}:{res.get('line', 0)}"
     server_channels = context.get("server_channels", [])
-    buggy_server = next((b for b in server_channels if "_NTO_CHF_FIXED_PRIORITY" in b["snippet"]), None)
+    buggy_server = next((b for b in server_channels if _has_active_fixed_priority_flag(b["snippet"])), None)
+    latency_us = int(anomaly.get("latency_us") or 0)
 
     if buggy_server:
         return {
@@ -59,13 +74,28 @@ def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note:
             "root_cause": "QNX IPC Priority Inversion via _NTO_CHF_FIXED_PRIORITY",
             "severity": "CRITICAL",
             "qnx_explanation": (
-                f"Thread prioritas tinggi (Prio {anomaly.get('priority')}) terhambat {anomaly.get('latency_us')} us "
+                f"Thread prioritas tinggi (Prio {anomaly.get('priority')}) terhambat {latency_us} us "
                 f"di {client_loc}. Channel server dibuat dengan flag _NTO_CHF_FIXED_PRIORITY yang mematikan "
                 f"Priority Inheritance bawaan kernel QNX Neutrino, sehingga server (Prio 10) disela oleh thread menengah."
             ),
             "file_location": f"{buggy_server['file']}:{buggy_server['line']} (blocked at {client_loc})",
             "code_before": "int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);",
             "code_after": "int chid = ChannelCreate(0); // Enable QNX kernel priority inheritance",
+        }
+
+    if latency_us <= 10_000 and anomaly.get("state_name") != "STATE_REPLY":
+        srv_loc = f"{server_channels[0]['file']}:{server_channels[0]['line']}" if server_channels else client_loc
+        return {
+            "provider": f"fallback ({note})",
+            "root_cause": "Healthy Real-Time QNX IPC (Priority Inheritance Active)",
+            "severity": "HEALTHY",
+            "qnx_explanation": (
+                f"Latensi IPC terukur {latency_us} us berada di bawah batas real-time 10,000 us. "
+                f"Server menggunakan ChannelCreate(0) sehingga Priority Inheritance kernel QNX aktif dan mencegah preempt berkepanjangan."
+            ),
+            "file_location": srv_loc,
+            "code_before": "// No change needed (ChannelCreate(0) active)",
+            "code_after": "// Real-time budget < 10,000 us verified healthy",
         }
 
     return {
@@ -83,7 +113,6 @@ def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note:
 
 
 async def _call_gemini(prompt: str, api_key: str, model: str) -> dict[str, Any]:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -92,14 +121,24 @@ async def _call_gemini(prompt: str, api_key: str, model: str) -> dict[str, Any]:
             "responseMimeType": "application/json",
         },
     }
-    async with httpx.AsyncClient(timeout=35.0) as client:
-        resp = await client.post(url, params={"key": api_key}, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    parsed = _strip_json_fences(text)
-    parsed["provider"] = f"gemini ({model})"
-    return parsed
+    candidates = [model] + ([m for m in ("gemini-3.5-flash-lite",) if m != model])
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for active_model in candidates:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{active_model}:generateContent"
+            try:
+                resp = await client.post(url, params={"key": api_key}, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = _strip_json_fences(text)
+                parsed["provider"] = f"gemini ({active_model})"
+                return parsed
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                await asyncio.sleep(0.3)
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _call_lmstudio(prompt: str, url: str, model: str) -> dict[str, Any]:
@@ -136,6 +175,8 @@ async def diagnose_anomaly(anomaly: dict[str, Any], context: dict[str, Any]) -> 
             return _rule_based_fallback(anomaly, context, "GEMINI_API_KEY not set")
         try:
             return await _call_gemini(prompt, api_key, gemini_model)
+        except httpx.HTTPStatusError as exc:
+            return _rule_based_fallback(anomaly, context, f"gemini HTTP {exc.response.status_code}")
         except Exception as exc:
             return _rule_based_fallback(anomaly, context, f"gemini error: {exc.__class__.__name__}")
 

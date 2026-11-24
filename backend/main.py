@@ -52,8 +52,8 @@ def _get_code_context(ip_hex: str, binary_path: str) -> dict[str, Any]:
         )
         stem_c = f"{Path(binary_path).stem}.c"
         channels = list(ctx.get("server_channels") or [])
-        channels.sort(key=lambda ch: Path(ch.get("file", "")).name != stem_c)
-        ctx["server_channels"] = channels
+        matching = [ch for ch in channels if Path(ch.get("file", "")).name == stem_c]
+        ctx["server_channels"] = matching or channels
         if len(_symbol_cache) >= 64:
             _symbol_cache.clear()
         _symbol_cache[cache_key] = ctx
@@ -143,7 +143,8 @@ async def resolve_symbol_endpoint(ip_hex: str | None = None, target: str | None 
         resolved_ip = detector.last_anomaly.get("ip_hex")
     if not resolved_ip:
         snap = detector.snapshot()
-        candidates = [t for t in snap["threads"] if t.get("ip_hex") and t["ip_hex"] != "0x0"]
+        pool = snap["threads"] or list(detector.threads.values())
+        candidates = [t for t in pool if t.get("ip_hex") and t["ip_hex"] != "0x0"]
         if candidates:
             top = max(candidates, key=lambda t: (t.get("latency_us", 0), t.get("priority", 0)))
             resolved_ip = top["ip_hex"]
@@ -174,19 +175,29 @@ async def resolve_symbol_endpoint(ip_hex: str | None = None, target: str | None 
 async def run_diagnosis(req: DiagnoseRequest | None = None) -> dict[str, Any]:
     anomaly = detector.last_anomaly
     if anomaly is None:
-        if req and req.ip_hex:
+        snap = detector.snapshot()
+        pool = snap["threads"] or list(detector.threads.values())
+        fallback_ip = req.ip_hex if req and req.ip_hex else None
+        top_thread = None
+        if not fallback_ip and pool:
+            candidates = [t for t in pool if t.get("ip_hex") and t["ip_hex"] != "0x0"]
+            if candidates:
+                top_thread = max(candidates, key=lambda t: (t.get("latency_us", 0), t.get("priority", 0)))
+                fallback_ip = top_thread["ip_hex"]
+
+        if fallback_ip:
             anomaly = {
                 "pid": detector.active_pid or 0,
-                "tid": 0,
-                "priority": 25,
-                "state_name": "STATE_REPLY",
+                "tid": top_thread["tid"] if top_thread else 0,
+                "priority": top_thread["priority"] if top_thread else 25,
+                "state_name": top_thread["state_name"] if top_thread else "RUNNING",
                 "latency_us": detector.peak_latency_us,
-                "ip_hex": req.ip_hex,
-                "reason": "Manual diagnosis requested",
-                "blocked_streak": 0,
+                "ip_hex": fallback_ip,
+                "reason": "Manual target inspection requested",
+                "blocked_streak": top_thread.get("blocked_streak", 0) if top_thread else 0,
             }
         else:
-            raise HTTPException(status_code=400, detail="No anomaly detected yet to diagnose.")
+            raise HTTPException(status_code=400, detail="No telemetry or anomaly detected yet to diagnose.")
 
     ip_hex = (req.ip_hex if req and req.ip_hex else None) or anomaly.get("ip_hex", "0x0")
     binary_path = _resolve_target_binary(

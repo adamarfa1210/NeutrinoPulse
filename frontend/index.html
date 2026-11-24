@@ -218,7 +218,7 @@
       <div class="h-12 shrink-0 bg-[#191919] border-b border-[#2D2D2D] px-5 flex items-center justify-between gap-3">
         <div class="flex items-center gap-3 min-w-0">
           <h1 id="page-title" class="text-[18px] font-semibold text-white truncate">Performance</h1>
-          <span id="header-alert-chip" class="hidden text-[11px] tnum px-2 py-0.5 rounded-[4px] bg-[#3B171B] border border-[#F87171] text-[#FCA5A5]">
+          <span id="header-alert-chip" class="hidden whitespace-nowrap shrink-0 text-[11px] tnum px-2 py-0.5 rounded-[4px] bg-[#3B171B] border border-[#F87171] text-[#FCA5A5]">
             ANOMALY
           </span>
         </div>
@@ -496,11 +496,14 @@
 
           <div id="diag-empty" class="bg-[#191919] border border-[#2D2D2D] p-4 text-center space-y-1">
             <div id="diag-empty-title" class="text-[13px] font-semibold text-[#CCCCCC]">Belum ada diagnosis AI</div>
-            <div class="text-[12px] text-[#8A8A8A]">Klik <span class="text-[#4CC2FF] font-semibold">✦ Diagnose with AI</span> di toolbar atas saat anomali terdeteksi.</div>
+            <div id="diag-empty-desc" class="text-[12px] text-[#8A8A8A]">Klik <span class="text-[#4CC2FF] font-semibold">✦ Diagnose with AI</span> di toolbar atas saat anomali terdeteksi.</div>
           </div>
 
           <div id="diag-result" class="hidden space-y-2">
-            <div id="diag-root-cause" class="text-[14px] font-semibold text-white"></div>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div id="diag-root-cause" class="text-[14px] font-semibold text-white"></div>
+              <span id="diag-meta" class="text-[11px] tnum text-[#8A8A8A]"></span>
+            </div>
             <div id="diag-location" class="mono text-[11px] text-[#4CC2FF] bg-[#191919] border border-[#2D2D2D] px-3 py-1.5 break-all"></div>
             <p id="diag-explanation" class="text-[12px] text-[#CCCCCC] leading-[18px]"></p>
           </div>
@@ -1031,10 +1034,29 @@
       switchTab("copilot");
     }
 
+    function clearDiagnosisCards(titleText, descText) {
+      document.getElementById("diag-result").classList.add("hidden");
+      document.getElementById("diag-empty").classList.remove("hidden");
+      document.getElementById("diag-provider").classList.add("hidden");
+      document.getElementById("diag-severity").classList.add("hidden");
+      document.getElementById("diag-error").classList.add("hidden");
+      document.getElementById("diag-empty-title").textContent = titleText;
+      document.getElementById("diag-empty-title").className = "text-[13px] font-semibold text-[#4CC2FF]";
+      document.getElementById("diag-empty-desc").textContent = descText;
+      document.getElementById("diff-box").classList.add("hidden");
+      document.getElementById("diff-empty").classList.remove("hidden");
+      document.getElementById("diff-empty").textContent = "Diff perbaikan kode C/C++ akan muncul setelah analisis AI dijalankan.";
+      document.getElementById("btn-copy-patch").disabled = true;
+    }
+
     function onTargetChange() {
       const target = document.getElementById("target-select").value;
       document.getElementById("spec-target").textContent = target;
       document.getElementById("perf-sub-core0").textContent = target;
+      clearDiagnosisCards(
+        `Target diubah ke ${target}`,
+        "Klik ✦ Diagnose with AI untuk meminta analisis Gemini terbaru sesuai target ini."
+      );
       if (manualIpOverride || lastFetchedSymbolKey) {
         const ip = manualIpOverride || lastFetchedSymbolKey.split("|")[0];
         lastFetchedSymbolKey = "";
@@ -1071,21 +1093,28 @@
       const target = document.getElementById("target-select").value;
 
       switchTab("copilot");
-      errBox.classList.add("hidden");
+      document.getElementById("tab-copilot").scrollTop = 0;
+      clearDiagnosisCards(
+        `⏳ Menghubungi Gemini AI (${target})...`,
+        "Mengirim telemetry runtime + konteks addr2line ke model Gemini."
+      );
+      document.getElementById("diff-empty").textContent = "⏳ Menunggu rekomendasi source-code diff dari Gemini...";
       btn.disabled = true;
       spinner.classList.remove("hidden");
       btnText.textContent = "Analyzing...";
 
       try {
+        const activeIp = manualIpOverride || (lastFetchedSymbolKey ? lastFetchedSymbolKey.split("|")[0] : null);
         const res = await fetch("/api/diagnose", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ target, ip_hex: manualIpOverride })
+          body: JSON.stringify({ target, ip_hex: activeIp })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Diagnosis failed");
 
         const d = data.diagnosis;
+        const a = data.anomaly || {};
         document.getElementById("diag-empty").classList.add("hidden");
         document.getElementById("diag-result").classList.remove("hidden");
 
@@ -1094,12 +1123,17 @@
         provEl.classList.remove("hidden");
 
         const sevEl = document.getElementById("diag-severity");
-        sevEl.textContent = d.severity || "CRITICAL";
-        sevEl.className = d.severity === "CRITICAL"
+        const sev = (d.severity || "CRITICAL").toUpperCase();
+        sevEl.textContent = sev;
+        sevEl.className = sev === "CRITICAL"
           ? "text-[11px] font-bold px-2 py-0.5 rounded-[4px] uppercase bg-[#3B171B] border border-[#F87171] text-[#F87171]"
-          : "text-[11px] font-bold px-2 py-0.5 rounded-[4px] uppercase bg-[#14263C] border border-[#4CC2FF] text-[#4CC2FF]";
+          : sev === "HEALTHY"
+            ? "text-[11px] font-bold px-2 py-0.5 rounded-[4px] uppercase bg-[#132B20] border border-[#245940] text-[#6CCB5F]"
+            : "text-[11px] font-bold px-2 py-0.5 rounded-[4px] uppercase bg-[#14263C] border border-[#4CC2FF] text-[#4CC2FF]";
 
+        const nowStr = new Date().toLocaleTimeString("en-GB");
         document.getElementById("diag-root-cause").textContent = d.root_cause || "Unknown issue";
+        document.getElementById("diag-meta").textContent = `Analyzed @ ${nowStr} • PID ${a.pid || "—"} • ${(a.latency_us ?? 0).toLocaleString()} µs • ${target}`;
         document.getElementById("diag-location").textContent = `Location: ${d.file_location || "—"}`;
         document.getElementById("diag-explanation").textContent = d.qnx_explanation || "";
 
@@ -1115,6 +1149,9 @@
         document.getElementById("diag-after").textContent = afterTxt;
         document.getElementById("btn-copy-patch").disabled = false;
       } catch (err) {
+        document.getElementById("diag-empty-title").textContent = "Gagal menjalankan analisis AI";
+        document.getElementById("diag-empty-title").className = "text-[13px] font-semibold text-[#F87171]";
+        document.getElementById("diff-empty").textContent = "Diff perbaikan kode C/C++ akan muncul setelah analisis AI dijalankan.";
         errBox.textContent = `Error: ${err.message}`;
         errBox.classList.remove("hidden");
       } finally {
@@ -1147,22 +1184,17 @@
       lastFetchedSymbolKey = "";
       lastDiffPair = { before: "", after: "" };
 
-      document.getElementById("diag-result").classList.add("hidden");
-      document.getElementById("diag-empty").classList.remove("hidden");
-      document.getElementById("diag-provider").classList.add("hidden");
-      document.getElementById("diag-severity").classList.add("hidden");
-      document.getElementById("diag-error").classList.add("hidden");
-      document.getElementById("diag-empty-title").textContent = "Belum ada diagnosis AI";
+      clearDiagnosisCards(
+        "Belum ada diagnosis AI",
+        "Klik ✦ Diagnose with AI di toolbar atas saat anomali terdeteksi."
+      );
       document.getElementById("diag-empty-title").className = "text-[13px] font-semibold text-[#CCCCCC]";
+      document.getElementById("diff-empty").textContent = "Diff perbaikan kode C/C++ akan muncul setelah analisis AI dijalankan.";
 
       document.getElementById("sym-content").classList.add("hidden");
       document.getElementById("sym-empty").classList.remove("hidden");
       document.getElementById("sym-badge").textContent = "Idle";
       document.getElementById("sym-badge").className = "text-[11px] mono px-2 py-0.5 rounded-[4px] bg-[#242424] border border-[#3D3D3D] text-[#8A8A8A]";
-
-      document.getElementById("diff-box").classList.add("hidden");
-      document.getElementById("diff-empty").classList.remove("hidden");
-      document.getElementById("btn-copy-patch").disabled = true;
 
       const res = await fetch("/api/state");
       renderAllViews(await res.json(), false);

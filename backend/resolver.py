@@ -72,7 +72,8 @@ def _find_server_channel_blocks(target_dir: Path) -> list[dict[str, Any]]:
     for src in sorted(target_dir.glob("*.c")):
         text = src.read_text(encoding="utf-8", errors="replace")
         for idx, line in enumerate(text.splitlines(), start=1):
-            if "ChannelCreate(" in line:
+            stripped = line.lstrip()
+            if "ChannelCreate(" in line and not stripped.startswith(("*", "//", "/*")):
                 blocks.append({
                     "file": str(src),
                     "line": idx,
