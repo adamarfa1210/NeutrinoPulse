@@ -59,7 +59,19 @@ def test_fastapi_endpoints() -> None:
         health = r_health.json()
         assert health["addr2line_available"] is True
 
-        r_diag = client.post("/api/diagnose", json={})
+        r_symbol = client.get("/api/symbol?target=brake_sim_buggy")
+        assert r_symbol.status_code == 200, r_symbol.text
+        sym = r_symbol.json()
+        assert sym["resolved"] is True
+        assert "critical_brake_client" in sym["client_resolution"]["function"]
+        assert sym["server_channel"] is not None
+        assert "_NTO_CHF_FIXED_PRIORITY" in sym["server_channel"]["snippet"]
+
+        r_fixed = client.get("/api/symbol?ip_hex=0x4011e9&target=brake_sim_fixed")
+        assert r_fixed.status_code == 200, r_fixed.text
+        assert "ChannelCreate(0)" in (r_fixed.json()["server_channel"] or {}).get("snippet", "")
+
+        r_diag = client.post("/api/diagnose", json={"target": "brake_sim_buggy"})
         assert r_diag.status_code == 200, r_diag.text
         body = r_diag.json()
         assert body["symbol_resolution"]["resolved"] is True

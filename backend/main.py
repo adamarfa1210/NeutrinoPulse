@@ -27,6 +27,37 @@ FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
 detector = AnomalyDetector()
 ws_clients: set[WebSocket] = set()
+_ALLOWED_TARGETS = {"brake_sim_buggy", "brake_sim_fixed"}
+_symbol_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _resolve_target_binary(target: str | None = None, binary_path: str | None = None) -> str:
+    if target and target in _ALLOWED_TARGETS:
+        candidate = Path(TARGET_DIR) / target
+        if candidate.is_file():
+            return str(candidate)
+    if binary_path:
+        return binary_path
+    return DEFAULT_BINARY
+
+
+def _get_code_context(ip_hex: str, binary_path: str) -> dict[str, Any]:
+    cache_key = (ip_hex.lower(), binary_path)
+    if cache_key not in _symbol_cache:
+        ctx = extract_code_context(
+            ip_hex=ip_hex,
+            target_dir=TARGET_DIR,
+            binary_path=binary_path,
+            addr2line_exe=ADDR2LINE_EXE,
+        )
+        stem_c = f"{Path(binary_path).stem}.c"
+        channels = list(ctx.get("server_channels") or [])
+        channels.sort(key=lambda ch: Path(ch.get("file", "")).name != stem_c)
+        ctx["server_channels"] = channels
+        if len(_symbol_cache) >= 64:
+            _symbol_cache.clear()
+        _symbol_cache[cache_key] = ctx
+    return _symbol_cache[cache_key]
 
 
 class UDPTelemetryProtocol(asyncio.DatagramProtocol):
@@ -79,6 +110,7 @@ app.add_middleware(
 class DiagnoseRequest(BaseModel):
     ip_hex: str | None = None
     binary_path: str | None = None
+    target: str | None = None
 
 
 @app.get("/api/health")
@@ -104,6 +136,40 @@ async def reset_state() -> dict[str, str]:
     return {"status": "reset"}
 
 
+@app.get("/api/symbol")
+async def resolve_symbol_endpoint(ip_hex: str | None = None, target: str | None = None) -> dict[str, Any]:
+    resolved_ip = ip_hex
+    if not resolved_ip and detector.last_anomaly:
+        resolved_ip = detector.last_anomaly.get("ip_hex")
+    if not resolved_ip:
+        snap = detector.snapshot()
+        candidates = [t for t in snap["threads"] if t.get("ip_hex") and t["ip_hex"] != "0x0"]
+        if candidates:
+            top = max(candidates, key=lambda t: (t.get("latency_us", 0), t.get("priority", 0)))
+            resolved_ip = top["ip_hex"]
+
+    if not resolved_ip or resolved_ip == "0x0":
+        return {
+            "resolved": False,
+            "ip_hex": None,
+            "client_resolution": {"resolved": False},
+            "client_snippet": "",
+            "server_channel": None,
+        }
+
+    binary_path = _resolve_target_binary(target=target)
+    ctx = _get_code_context(resolved_ip, binary_path)
+    channels = ctx.get("server_channels") or []
+    return {
+        "resolved": bool(ctx.get("client_resolution", {}).get("resolved")),
+        "ip_hex": resolved_ip,
+        "target_binary": Path(binary_path).name,
+        "client_resolution": ctx.get("client_resolution", {"resolved": False}),
+        "client_snippet": ctx.get("client_snippet", ""),
+        "server_channel": channels[0] if channels else None,
+    }
+
+
 @app.post("/api/diagnose")
 async def run_diagnosis(req: DiagnoseRequest | None = None) -> dict[str, Any]:
     anomaly = detector.last_anomaly
@@ -123,14 +189,12 @@ async def run_diagnosis(req: DiagnoseRequest | None = None) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="No anomaly detected yet to diagnose.")
 
     ip_hex = (req.ip_hex if req and req.ip_hex else None) or anomaly.get("ip_hex", "0x0")
-    binary_path = (req.binary_path if req and req.binary_path else None) or DEFAULT_BINARY
-
-    context = extract_code_context(
-        ip_hex=ip_hex,
-        target_dir=TARGET_DIR,
-        binary_path=binary_path,
-        addr2line_exe=ADDR2LINE_EXE,
+    binary_path = _resolve_target_binary(
+        target=req.target if req else None,
+        binary_path=req.binary_path if req else None,
     )
+
+    context = _get_code_context(ip_hex, binary_path)
     diagnosis = await diagnose_anomaly(anomaly, context)
     return {
         "anomaly": anomaly,
