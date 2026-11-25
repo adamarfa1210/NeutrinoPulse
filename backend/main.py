@@ -79,21 +79,22 @@ def _get_code_context(ip_hex: str, binary_path: str) -> dict[str, Any]:
             addr2line_exe=ADDR2LINE_EXE,
         )
         stem = Path(binary_path).stem
-        channels = list(ctx.get("server_channels") or [])
-        matching = [
-            ch for ch in channels
-            if Path(ch.get("file", "")).stem == stem
-            and Path(ch.get("file", "")).suffix.lower() in _SOURCE_IMPL_EXTS
-        ]
-        if matching:
-            ctx["server_channels"] = matching
-        elif not stem.startswith("brake_sim"):
-            ctx["server_channels"] = [
-                ch for ch in channels
-                if not Path(ch.get("file", "")).name.startswith("brake_sim_")
+        for key in ("server_channels", "server_handlers"):
+            blocks = list(ctx.get(key) or [])
+            matching = [
+                ch for ch in blocks
+                if Path(ch.get("file", "")).stem == stem
+                and Path(ch.get("file", "")).suffix.lower() in _SOURCE_IMPL_EXTS
             ]
-        else:
-            ctx["server_channels"] = channels
+            if matching:
+                ctx[key] = matching
+            elif not stem.startswith("brake_sim"):
+                ctx[key] = [
+                    ch for ch in blocks
+                    if not Path(ch.get("file", "")).name.startswith("brake_sim_")
+                ]
+            else:
+                ctx[key] = blocks
         if len(_symbol_cache) >= 64:
             _symbol_cache.clear()
         _symbol_cache[cache_key] = ctx

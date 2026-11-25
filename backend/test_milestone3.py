@@ -63,24 +63,44 @@ def test_addr2line_and_context_pairing() -> None:
 
 
 def test_phase3_cpp_cache_and_fallback() -> None:
-    # Recursive C++ ChannelCreate discovery (NP-12)
+    # Recursive C++ ChannelCreate + MsgReceive discovery (NP-12) and dynamic diff/bottleneck fallback
     with tempfile.TemporaryDirectory() as tmp:
         nested = Path(tmp) / "src"
         nested.mkdir()
         cpp_file = nested / "sensor_srv.cpp"
-        cpp_file.write_text("int init() {\n  int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);\n  return chid;\n}\n", encoding="utf-8")
+        cpp_file.write_text(
+            "int init() {\n  int g_chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);\n  return g_chid;\n}\n",
+            encoding="utf-8",
+        )
         ctx_cpp = extract_code_context("0x0", target_dir=tmp, binary_path=str(Path(tmp) / "missing"))
         assert len(ctx_cpp["server_channels"]) == 1
         assert Path(ctx_cpp["server_channels"][0]["file"]).name == "sensor_srv.cpp"
 
-        # Fallback severity must distinguish latency == 0 (WARNING) vs active stall (CRITICAL) (NP-14)
         calm = _rule_based_fallback(
             {"priority": 25, "latency_us": 0, "state_name": "RUNNING", "tid": 3, "ip_hex": "0x0"},
             ctx_cpp,
             "unit",
         )
         assert calm["severity"] == "WARNING"
-    print("[PASS] Phase 3 recursive C/C++ scan & fallback severity calibrated")
+        assert "g_chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);" in calm["code_before"]
+        assert "g_chid = ChannelCreate(0);" in calm["code_after"]
+
+        # Non-priority-inversion server bottleneck with ChannelCreate(0) + MsgReceive()
+        dsp_ctx = {
+            "client_resolution": {"resolved": True, "function": "fc_cli", "file": "fc.c", "line": 42},
+            "client_snippet": ">>> 42 | NP_MSGSEND(coid, ...);",
+            "server_channels": [{"file": "srv.c", "line": 10, "snippet": ">>> 10 | int chid = ChannelCreate(0);"}],
+            "server_handlers": [{"file": "srv.c", "line": 25, "snippet": ">>> 25 | int rcvid = MsgReceive(chid, &m, sizeof(m), NULL);"}],
+        }
+        dsp_diag = _rule_based_fallback(
+            {"priority": 24, "latency_us": 35000, "state_name": "STATE_REPLY", "tid": 3, "ip_hex": "0x1234"},
+            dsp_ctx,
+            "unit",
+        )
+        assert dsp_diag["severity"] == "CRITICAL"
+        assert "Bottleneck" in dsp_diag["root_cause"]
+        assert "MsgReceive" in dsp_diag["code_before"]
+    print("[PASS] Phase 3 recursive C/C++ scan, dynamic diff, & non-PI handler fallback")
 
 
 def test_fastapi_endpoints() -> None:

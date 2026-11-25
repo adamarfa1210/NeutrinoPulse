@@ -10,8 +10,8 @@ import httpx
 
 SYSTEM_INSTRUCTION = (
     "You are a senior QNX Neutrino RTOS 8.0 systems engineer. "
-    "Analyze the runtime IPC/thread snapshot and the resolved C/C++ source snippets (client call site and server ChannelCreate setup). "
-    "Distinguish active C/C++ statements from comments, and pay close attention to measured latency vs the 10,000 us real-time budget. "
+    "Analyze the runtime IPC/thread snapshot and the resolved C/C++ source snippets (client call site, server ChannelCreate setup, and MsgReceive/MsgReply server handler). "
+    "Distinguish active C/C++ statements from comments or inactive conditional branches, and check whether latency comes from _NTO_CHF_FIXED_PRIORITY priority inversion or synchronous work inside the MsgReceive() handler. "
     "If active ChannelCreate(0) is already used and measured latency is <= 10,000 us with no blocking anomaly, respond with severity \"HEALTHY\", "
     "explain that Priority Inheritance is active and latency is healthy, and set code_before/code_after to \"// No change needed\". "
     "Respond ONLY with a valid JSON object containing exact keys: "
@@ -33,7 +33,11 @@ def _build_prompt(anomaly: dict[str, Any], context: dict[str, Any]) -> str:
     res = context.get("client_resolution", {})
     server_text = "\n\n".join(
         f"Server Channel File: {b['file']} (line {b['line']})\n```c\n{b['snippet']}\n```"
-        for b in context.get("server_channels", [])[:2]
+        for b in context.get("server_channels", [])[:3]
+    )
+    handler_text = "\n\n".join(
+        f"Server Handler File: {b['file']} (line {b['line']})\n```c\n{b['snippet']}\n```"
+        for b in context.get("server_handlers", [])[:2]
     )
     return (
         f"### Runtime Anomaly Snapshot\n"
@@ -46,8 +50,17 @@ def _build_prompt(anomaly: dict[str, Any], context: dict[str, Any]) -> str:
         f"- Location: {res.get('file', 'unknown')}:{res.get('line', 0)}\n"
         f"```c\n{context.get('client_snippet', '(no snippet)')}\n```\n\n"
         f"### Server Channel Initialization Context\n"
-        f"{server_text or '(no ChannelCreate found)'}\n"
+        f"{server_text or '(no ChannelCreate found)'}\n\n"
+        f"### Server Message Handler Context (MsgReceive / MsgReply)\n"
+        f"{handler_text or '(no MsgReceive found)'}\n"
     )
+
+
+def _extract_marked_line(snippet: str) -> str:
+    for ln in snippet.splitlines():
+        if ln.startswith(">>>"):
+            return ln.split("|", 1)[-1].strip()
+    return ""
 
 
 def _has_active_fixed_priority_flag(snippet: str) -> bool:
@@ -60,24 +73,49 @@ def _has_active_fixed_priority_flag(snippet: str) -> bool:
     return False
 
 
+def _has_active_pi_channel(snippet: str) -> bool:
+    for ln in snippet.splitlines():
+        code_part = ln.split("|", 1)[-1].strip()
+        if code_part.startswith(("*", "//", "/*")):
+            continue
+        if "ChannelCreate(0)" in code_part:
+            return True
+    return False
+
+
 def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note: str) -> dict[str, Any]:
     """Deterministic QNX diagnostic fallback if no API key is configured or offline."""
     res = context.get("client_resolution", {})
     is_resolved = bool(res.get("resolved"))
     client_loc = f"{res.get('file', 'unknown')}:{res.get('line', 0)}" if is_resolved else "unresolved symbol (outside target DWARF)"
     server_channels = context.get("server_channels", [])
+    server_handlers = context.get("server_handlers", [])
     buggy_server = next((b for b in server_channels if _has_active_fixed_priority_flag(b["snippet"])), None)
+    has_pi_branch = any(_has_active_pi_channel(b["snippet"]) for b in server_channels)
     latency_us = int(anomaly.get("latency_us") or 0)
     is_active_stall = latency_us > 10_000 or anomaly.get("state_name") in ("STATE_REPLY", "STATE_MUTEX")
 
     if buggy_server:
         sev = "CRITICAL" if is_active_stall else "WARNING"
         loc_suffix = f" (blocked at {client_loc})" if is_resolved else ""
+        actual_before = _extract_marked_line(buggy_server["snippet"]) or "int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);"
+        actual_after = (
+            f"{actual_before.replace('_NTO_CHF_FIXED_PRIORITY', '0')} // Enable QNX kernel priority inheritance"
+            if "_NTO_CHF_FIXED_PRIORITY" in actual_before
+            else "// Ensure ChannelCreate(0) priority inheritance is active"
+        )
         detail = (
             f"Thread prioritas tinggi (Prio {anomaly.get('priority')}) terhambat {latency_us} us di {client_loc}."
             if is_active_stall
             else f"Latensi terukur saat ini {latency_us} us (belum melewati 10,000 us), namun konfigurasi channel berisiko memicu Priority Inversion."
         )
+        multi_note = ""
+        if has_pi_branch and server_handlers:
+            h0 = server_handlers[0]
+            multi_note = (
+                f" Catatan: sumber juga memiliki ChannelCreate(0); jika mode itu yang aktif saat runtime, "
+                f"periksa bottleneck komputasi pada handler MsgReceive() di {h0['file']}:{h0['line']}."
+            )
         return {
             "provider": f"fallback ({note})",
             "root_cause": "QNX IPC Priority Inversion via _NTO_CHF_FIXED_PRIORITY",
@@ -85,10 +123,11 @@ def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note:
             "qnx_explanation": (
                 f"{detail} Channel server dibuat dengan flag _NTO_CHF_FIXED_PRIORITY yang mematikan "
                 f"Priority Inheritance bawaan kernel QNX Neutrino, sehingga thread server tetap pada prioritas statis dan dapat disela thread menengah."
+                f"{multi_note}"
             ),
             "file_location": f"{buggy_server['file']}:{buggy_server['line']}{loc_suffix}",
-            "code_before": "int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);",
-            "code_after": "int chid = ChannelCreate(0); // Enable QNX kernel priority inheritance",
+            "code_before": actual_before,
+            "code_after": actual_after,
         }
 
     if latency_us <= 10_000 and anomaly.get("state_name") != "STATE_REPLY":
@@ -119,6 +158,23 @@ def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note:
             "file_location": client_loc,
             "code_before": "// Target binary mismatch or missing -g debug info",
             "code_after": "// Select matching ELF binary & source folder in Target Config",
+        }
+
+    if server_handlers:
+        h0 = server_handlers[0]
+        srv_loc = f"{h0['file']}:{h0['line']}"
+        return {
+            "provider": f"fallback ({note})",
+            "root_cause": "Server Handler Processing Bottleneck (Non-Priority-Inversion IPC Stall)",
+            "severity": "CRITICAL" if latency_us > 10_000 else "WARNING",
+            "qnx_explanation": (
+                f"Channel sudah mendukung Priority Inheritance, tetapi TID {anomaly.get('tid')} (Prio {anomaly.get('priority')}) "
+                f"tetap tertahan {latency_us} us di {client_loc}. Periksa beban CPU / pekerjaan sinkron di handler server "
+                f"sekitar {srv_loc} sebelum memanggil MsgReply()."
+            ),
+            "file_location": f"{srv_loc} (client at {client_loc})",
+            "code_before": _extract_marked_line(h0["snippet"]) or f"// Slow work inside {srv_loc}",
+            "code_after": "// Move heavy work outside MsgReceive/MsgReply critical path or reply asynchronously",
         }
 
     return {

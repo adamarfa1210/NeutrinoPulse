@@ -19,11 +19,27 @@ static np_shm_region_t *g_np_shm = NULL;
  * Fungsi noinline agar __builtin_return_address(0) menangkap alamat instruksi
  * tepat di baris kode aplikasi pemanggil (menghindari RIP terjebak di libc.so).
  */
-static __attribute__((noinline)) uint64_t np_get_caller_ip(void) {
+static __attribute__((noinline, unused)) uint64_t np_get_caller_ip(void) {
     return (uint64_t)(uintptr_t)__builtin_return_address(0);
 }
 
-static inline int np_probe_init(void) {
+/* Lazy-attach untuk translation unit lain pada proyek multi-file C/C++ */
+static inline __attribute__((unused)) int np_probe_attach_existing(void) {
+    int fd = shm_open(NP_SHM_NAME, O_RDWR, 0);
+    if (fd < 0) return -1;
+    void *ptr = mmap(NULL, sizeof(np_shm_region_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ptr == MAP_FAILED) return -1;
+    np_shm_region_t *cand = (np_shm_region_t *)ptr;
+    if (cand->magic != NP_SHM_MAGIC || cand->target_pid != (uint32_t)getpid()) {
+        munmap(ptr, sizeof(np_shm_region_t));
+        return -1;
+    }
+    g_np_shm = cand;
+    return 0;
+}
+
+static inline __attribute__((unused)) int np_probe_init(void) {
     /* ponytail: single global /np_probe_shm assumes one instrumented PID at a time; upgrade to per-PID SHM for multi-process IPC. */
     int fd = shm_open(NP_SHM_NAME, O_RDWR | O_CREAT, 0640);
     if (fd < 0) {
@@ -53,7 +69,7 @@ static inline int np_probe_init(void) {
     return 0;
 }
 
-static inline void np_probe_cleanup(void) {
+static inline __attribute__((unused)) void np_probe_cleanup(void) {
     if (g_np_shm) {
         if (g_np_shm->target_pid == (uint32_t)getpid()) {
             g_np_shm->target_pid = 0;
@@ -63,13 +79,18 @@ static inline void np_probe_cleanup(void) {
     }
 }
 
-static inline long np_msgsend_traced(int coid, const void *smsg, size_t sbytes,
-                                     void *rmsg, size_t rbytes, uint64_t caller_ip) {
+static inline __attribute__((unused)) long np_msgsend_traced(int coid, const void *smsg, size_t sbytes,
+                                                             void *rmsg, size_t rbytes, uint64_t caller_ip) {
     uint32_t tid = (uint32_t)pthread_self();
     np_probe_slot_t *slot = NULL;
     uint64_t t_start = ClockCycles();
 
-    if (g_np_shm && g_np_shm->cycles_per_sec > 0) {
+    if (!g_np_shm) {
+        np_probe_attach_existing();
+    }
+    if (g_np_shm && g_np_shm->magic == NP_SHM_MAGIC &&
+        g_np_shm->target_pid == (uint32_t)getpid() &&
+        g_np_shm->cycles_per_sec > 0) {
         slot = &g_np_shm->slots[tid % NP_MAX_SLOTS];
         slot->seq++;
         __sync_synchronize();

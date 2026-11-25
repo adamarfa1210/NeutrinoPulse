@@ -138,22 +138,33 @@ def _read_snippet(file_path: Path, center_line: int, radius: int = 20) -> str:
     return "\n".join(out)
 
 
-def _find_server_channel_blocks(target_dir: Path) -> list[dict[str, Any]]:
-    """Scan C/C++ source files recursively for ChannelCreate(...) initialization."""
+def _find_call_blocks(target_dir: Path, call_token: str, radius: int = 10) -> list[dict[str, Any]]:
+    """Scan C/C++ source files recursively for non-comment occurrences of call_token."""
     blocks: list[dict[str, Any]] = []
     for src in iter_source_files(target_dir):
         text = src.read_text(encoding="utf-8", errors="replace")
         for idx, line in enumerate(text.splitlines(), start=1):
             stripped = line.lstrip()
-            if "ChannelCreate(" in line and not stripped.startswith(("*", "//", "/*")):
+            if call_token in line and not stripped.startswith(("*", "//", "/*")):
                 blocks.append({
                     "file": str(src),
                     "line": idx,
-                    "snippet": _read_snippet(src, idx, radius=10),
+                    "snippet": _read_snippet(src, idx, radius=radius),
                 })
+    return blocks
+
+
+def _find_server_channel_blocks(target_dir: Path) -> list[dict[str, Any]]:
+    """Scan C/C++ source files recursively for ChannelCreate(...) initialization."""
+    blocks = _find_call_blocks(target_dir, "ChannelCreate(", radius=10)
     # Put files containing _NTO_CHF_FIXED_PRIORITY first so buggy server config is highlighted
     blocks.sort(key=lambda b: "_NTO_CHF_FIXED_PRIORITY" not in b["snippet"])
     return blocks
+
+
+def _find_server_handler_blocks(target_dir: Path) -> list[dict[str, Any]]:
+    """Scan C/C++ source files recursively for MsgReceive(...) server handler loops."""
+    return _find_call_blocks(target_dir, "MsgReceive(", radius=12)
 
 
 def extract_code_context(
@@ -162,15 +173,16 @@ def extract_code_context(
     binary_path: str,
     addr2line_exe: str = DEFAULT_ADDR2LINE,
 ) -> dict[str, Any]:
-    """Resolve client IP and pair it with server ChannelCreate context."""
+    """Resolve client IP and pair it with server ChannelCreate and MsgReceive context."""
     resolved = resolve_ip(ip_hex, binary_path, addr2line_exe)
     client_snippet = ""
     if resolved.get("resolved"):
         client_snippet = _read_snippet(Path(resolved["file"]), resolved["line"], radius=20)
 
-    server_blocks = _find_server_channel_blocks(Path(target_dir))
+    target_root = Path(target_dir)
     return {
         "client_resolution": resolved,
         "client_snippet": client_snippet,
-        "server_channels": server_blocks,
+        "server_channels": _find_server_channel_blocks(target_root),
+        "server_handlers": _find_server_handler_blocks(target_root),
     }

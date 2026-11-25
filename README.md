@@ -89,23 +89,46 @@ build.bat
 *(Or source `qnxsdp-env.bat` / `qnxsdp-env.sh` and run `make all` using `qcc -Vgcc_ntox86_64`).*
 
 ### 2. Boot QNX 8.0 in QEMU (2 Cores)
+If you do not yet have a QNX 8.0 QEMU disk image, generate one with QNX SDP 8.0 (`mkqnximage`) using your own SSH public key:
+```sh
+ssh-keygen -t ed25519 -f qnx_qemu_ed25519 -N ""
+mkqnximage --type=qemu --arch=x86_64 --ssh-ident=qnx_qemu_ed25519.pub --noprompt --build
+```
+Set `QNX_QEMU_DISK` (and optionally `QEMU_EXE`) to point to the generated `disk-qemu`, then launch:
 ```cmd
+:: Windows
+set QNX_QEMU_DISK=C:\path\to\output\disk-qemu
 run_qemu.bat
+```
+```sh
+# Linux / WSL
+QNX_QEMU_DISK=/path/to/output/disk-qemu ./run_qemu.sh
 ```
 
 ### 3. Start Host Backend & Dashboard
 ```cmd
 cd backend
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 copy .env.example .env
-# Add your GEMINI_API_KEY inside .env
+# Optionally add GEMINI_API_KEY inside .env (or use built-in deterministic fallback)
 run_backend.bat
 ```
+On Linux / WSL, create `.venv`, install `requirements.txt`, copy `.env.example` to `.env`, and run `./run_backend.sh`.
+> **WSL2 Note:** If QEMU runs on the Windows host while the backend runs inside WSL2, QEMU SLIRP sends UDP `10.0.2.2:9999` to the Windows host interface; run both QEMU and the backend on the same OS (or use WSL2 mirrored networking) so UDP `9999` packets reach FastAPI cleanly.
+
 Open **`http://127.0.0.1:8090/`** in your browser or VS Code Simple Browser.
 
 ### 4. Deploy & Run on QNX Target
 Transfer `np_agent`, `brake_sim_buggy`, and `brake_sim_fixed` to `/tmp/` on QEMU and run:
 ```sh
+scp -P 2222 -i qnx_qemu_ed25519 -o Ciphers=aes256-ctr -o MACs=hmac-sha2-256 \
+  target/np_agent target/brake_sim_buggy target/brake_sim_fixed root@127.0.0.1:/tmp/
+ssh -p 2222 -i qnx_qemu_ed25519 -o Ciphers=aes256-ctr -o MACs=hmac-sha2-256 root@127.0.0.1
+```
+Inside the QNX target shell:
+```sh
+chmod +x /tmp/np_agent /tmp/brake_sim_buggy /tmp/brake_sim_fixed
 /tmp/np_agent 10.0.2.2 9999 &
 /tmp/brake_sim_buggy
 ```
