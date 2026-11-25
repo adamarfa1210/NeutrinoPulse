@@ -7,7 +7,7 @@
 #define NP_HOST_IP   "10.0.2.2"
 #define NP_SHM_NAME  "/np_probe_shm"
 #define NP_SHM_MAGIC 0x4E505348U  /* 'NPSH' */
-#define NP_MAX_SLOTS 32
+#define NP_MAX_SLOTS 256
 
 /*
  * Kontrak biner UDP (27 bytes, little-endian, zero padding).

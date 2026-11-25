@@ -3,18 +3,23 @@
 import os
 from pathlib import Path
 import struct
+import tempfile
 
 os.environ["UDP_PORT"] = "19999"
 
 from fastapi.testclient import TestClient
 
-from main import app, detector
-from resolver import extract_code_context
+from ai_copilot import _rule_based_fallback
+from main import _get_code_context, _symbol_cache, app, detector
+from resolver import extract_code_context, find_addr2line, resolve_ip
 from telemetry import PACKET_FMT, PACKET_SIZE, AnomalyDetector, decode_packet
 
 
 def test_decoder_and_detector() -> None:
     assert PACKET_SIZE == 27, f"Expected 27 bytes, got {PACKET_SIZE}"
+    assert decode_packet(b"A" * PACKET_SIZE) is None, "Corrupt 27B noise must be rejected"
+    assert decode_packet(struct.pack(PACKET_FMT, 12345, 3, 1, 256, 100, 0x4011E9)) is None
+    assert decode_packet(struct.pack(PACKET_FMT, 12345, 3, 1, 25, 99_999_999, 0x4011E9)) is None
     raw = struct.pack(PACKET_FMT, 12345, 3, 6, 25, 65000, 0x4011E9)
     pkt = decode_packet(raw)
     assert pkt is not None
@@ -31,12 +36,21 @@ def test_decoder_and_detector() -> None:
     assert det.is_anomaly
     assert det.last_anomaly is not None
     assert det.last_anomaly["latency_us"] == 65000
-    print("[PASS] Binary decoder (27 bytes) & AnomalyDetector Z-Score/threshold")
+
+    # Low-prio (<20) stuck STATE_REPLY with 0 us must still log to history (NP-17)
+    hist_before = len(det.history)
+    det.ingest(decode_packet(struct.pack(PACKET_FMT, 12345, 7, 6, 10, 0, 0x401239)))
+    det.ingest(decode_packet(struct.pack(PACKET_FMT, 12345, 7, 6, 10, 0, 0x401239)))
+    assert len(det.history) >= hist_before + 1
+    print("[PASS] Binary decoder (27 bytes + bounds check) & AnomalyDetector Z-Score/threshold")
 
 
 def test_addr2line_and_context_pairing() -> None:
     target_dir = str(Path(__file__).resolve().parent.parent / "target")
     binary_path = str(Path(target_dir) / "brake_sim_buggy")
+    assert Path(find_addr2line()).name.startswith("ntox86_64-addr2line")
+    bad = resolve_ip("--help", binary_path=binary_path)
+    assert bad["resolved"] is False and "Invalid" in bad["error"]
     ctx = extract_code_context("0x4011e9", target_dir=target_dir, binary_path=binary_path)
 
     res = ctx["client_resolution"]
@@ -46,6 +60,27 @@ def test_addr2line_and_context_pairing() -> None:
     assert len(ctx["server_channels"]) >= 1
     assert "_NTO_CHF_FIXED_PRIORITY" in ctx["server_channels"][0]["snippet"]
     print(f"[PASS] addr2line resolved 0x4011e9 -> {res['function']} ({Path(res['file']).name}:{res['line']}) + paired server ChannelCreate")
+
+
+def test_phase3_cpp_cache_and_fallback() -> None:
+    # Recursive C++ ChannelCreate discovery (NP-12)
+    with tempfile.TemporaryDirectory() as tmp:
+        nested = Path(tmp) / "src"
+        nested.mkdir()
+        cpp_file = nested / "sensor_srv.cpp"
+        cpp_file.write_text("int init() {\n  int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);\n  return chid;\n}\n", encoding="utf-8")
+        ctx_cpp = extract_code_context("0x0", target_dir=tmp, binary_path=str(Path(tmp) / "missing"))
+        assert len(ctx_cpp["server_channels"]) == 1
+        assert Path(ctx_cpp["server_channels"][0]["file"]).name == "sensor_srv.cpp"
+
+        # Fallback severity must distinguish latency == 0 (WARNING) vs active stall (CRITICAL) (NP-14)
+        calm = _rule_based_fallback(
+            {"priority": 25, "latency_us": 0, "state_name": "RUNNING", "tid": 3, "ip_hex": "0x0"},
+            ctx_cpp,
+            "unit",
+        )
+        assert calm["severity"] == "WARNING"
+    print("[PASS] Phase 3 recursive C/C++ scan & fallback severity calibrated")
 
 
 def test_fastapi_endpoints() -> None:
@@ -71,6 +106,21 @@ def test_fastapi_endpoints() -> None:
         assert r_fixed.status_code == 200, r_fixed.text
         assert "ChannelCreate(0)" in (r_fixed.json()["server_channel"] or {}).get("snippet", "")
 
+        assert client.get("/api/symbol?ip_hex=--help").status_code == 400
+        assert client.post("/api/diagnose", json={"binary_path": str(Path(__file__).resolve())}).status_code == 400
+
+        r_cfg = client.get("/api/config")
+        assert r_cfg.status_code == 200 and "brake_sim_buggy" in r_cfg.json()["targets"]
+
+        # Cache invalidation on /api/reset (NP-13)
+        _ = _get_code_context("0x4011e9", str(Path(__file__).resolve().parent.parent / "target" / "brake_sim_buggy"))
+        assert len(_symbol_cache) >= 1
+        assert client.post("/api/reset").status_code == 200
+        assert len(_symbol_cache) == 0
+
+        # Restore anomaly packet before /api/diagnose check
+        detector.ingest(decode_packet(struct.pack(PACKET_FMT, 2740246, 3, 6, 25, 65533, 0x4011E9)))
+
         r_diag = client.post("/api/diagnose", json={"target": "brake_sim_buggy"})
         assert r_diag.status_code == 200, r_diag.text
         body = r_diag.json()
@@ -84,5 +134,6 @@ def test_fastapi_endpoints() -> None:
 if __name__ == "__main__":
     test_decoder_and_detector()
     test_addr2line_and_context_pairing()
+    test_phase3_cpp_cache_and_fallback()
     test_fastapi_endpoints()
     print(">> ALL MILESTONE 3 TESTS PASSED <<")

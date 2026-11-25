@@ -132,4 +132,5 @@ Follow our full hands-on engineering walkthrough in **[CODELAB.md](./CODELAB.md)
 
 * **QNX Neutrino Microkernel IPC & Thread Control:** `ChannelCreate(_NTO_CHF_FIXED_PRIORITY)`, `ChannelCreate(0)`, `MsgSend()`, `MsgReceive()`, `MsgReply()`, `ThreadCtl(_NTO_TCTL_RUNMASK, ...)`, `ClockCycles()`, and `SYSPAGE_ENTRY(qtime)->cycles_per_sec` (`target/np_probe.h`, `target/brake_sim_core.h`, `target/brake_sim_buggy.c`, `target/brake_sim_fixed.c`).
 * **QNX Procfs Instrumentation:** `DCMD_PROC_TIDSTATUS`, `DCMD_PROC_CURTHREAD`, `DCMD_PROC_GETGREG`, and `sys/states.h` thread states (`target/np_agent.c`, `backend/telemetry.py`).
-* **QNX SDP 8.0 Toolchain:** Cross-compiled with `qcc -Vgcc_ntox86_64 -g -fno-pie -no-pie` and symbol-resolved via `ntox86_64-addr2line.exe` (`target/Makefile`, `backend/resolver.py`).
+* **QNX SDP 8.0 Toolchain:** Cross-compiled with `qcc -Vgcc_ntox86_64 -g -fno-pie -no-pie` and symbol-resolved via `ntox86_64-addr2line` (`target/Makefile`, `backend/resolver.py`); ASLR/PIE binaries are also normalized automatically by `np_agent` via `DCMD_PROC_MAPDEBUG`.
+* **Current Scope:** Designed for single-target process instrumentation (`/np_probe_shm`, up to 256 thread slots) per active monitoring session.

@@ -37,6 +37,14 @@
     }
     .tnum { font-variant-numeric: tabular-nums; }
 
+    /* Offline minimal layout fallback when CDN Tailwind is unreachable */
+    .hidden { display: none; }
+    .flex { display: flex; }
+    .flex-col { flex-direction: column; }
+    .flex-1 { flex: 1 1 0%; }
+    .grid { display: grid; }
+    .h-screen { height: 100vh; }
+
     /* Fluent thin scrollbar */
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -542,7 +550,7 @@
 
   <!-- Target Config Modal -->
   <div id="config-modal" class="hidden fixed inset-0 bg-black/60 flex items-center justify-center z-50" onclick="if(event.target===this) toggleConfigModal()">
-    <div class="w-[420px] max-w-[92vw] bg-[#202020] border border-[#3D3D3D] rounded-[4px] p-4 space-y-3">
+    <div class="w-[520px] max-w-[94vw] bg-[#202020] border border-[#3D3D3D] rounded-[4px] p-4 space-y-3">
       <div class="flex items-center justify-between border-b border-[#2D2D2D] pb-2">
         <span class="text-[14px] font-semibold text-white">NeutrinoPulse System Config</span>
         <button onclick="toggleConfigModal()" class="text-[#8A8A8A] hover:text-white text-[13px]">✕</button>
@@ -552,6 +560,16 @@
         <span class="text-[#8A8A8A]">LLM Provider:</span><span id="cfg-llm" class="text-white">—</span>
         <span class="text-[#8A8A8A]">addr2line Tool:</span><span id="cfg-addr2line" class="text-white">—</span>
         <span class="text-[#8A8A8A]">Language Scope:</span><span class="text-[#4CC2FF]">QNX C / C++ ELF (-g)</span>
+      </div>
+      <div class="border-t border-[#2D2D2D] pt-3 space-y-2">
+        <label for="cfg-target-dir" class="block text-[11px] font-semibold uppercase tracking-wider text-[#8A8A8A]">
+          Target ELF &amp; C/C++ Source Folder
+        </label>
+        <div class="flex items-center gap-2">
+          <input id="cfg-target-dir" type="text" placeholder="Path to compiled ELF &amp; source folder" class="flex-1 bg-[#191919] border border-[#3D3D3D] rounded-[4px] px-2.5 py-1.5 text-[12px] mono text-white focus:outline-none focus:border-[#4CC2FF]" />
+          <button id="btn-apply-cfg" onclick="applyTargetDir()" class="fluent-btn fluent-btn-accent shrink-0">Apply &amp; Scan</button>
+        </div>
+        <div id="cfg-dir-msg" class="text-[11px] text-[#8A8A8A] min-h-[16px]"></div>
       </div>
       <div class="flex justify-end pt-1">
         <button onclick="toggleConfigModal()" class="fluent-btn">Close</button>
@@ -599,6 +617,7 @@
     let manualIpOverride = null;
     let lastFetchedSymbolKey = "";
     let lastDiffPair = { before: "", after: "" };
+    const resolvedFnByIp = new Map();
 
     function escapeHtml(val) {
       return String(val ?? "")
@@ -616,56 +635,96 @@
       return lines.slice(Math.max(0, idx - radius), Math.min(lines.length, idx + radius + 1)).join("\n");
     }
 
-    // Initialize Fluent Sharp Grid Chart.js
+    function drawOfflineChart(ctx, data) {
+      const canvas = ctx.canvas;
+      const w = canvas.width = canvas.clientWidth || 600;
+      const h = canvas.height = canvas.clientHeight || 220;
+      ctx.clearRect(0, 0, w, h);
+      const vals = (data.datasets[0]?.data || []);
+      const maxY = Math.max(12000, ...vals, 1);
+      const yThresh = h - (10000 / maxY) * (h - 20) - 10;
+      ctx.strokeStyle = "rgba(248, 113, 113, 0.75)";
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, yThresh);
+      ctx.lineTo(w, yThresh);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (!vals.length) return;
+      ctx.strokeStyle = data.datasets[0].borderColor || "#3B82F6";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      vals.forEach((v, i) => {
+        const x = vals.length === 1 ? w / 2 : (i / (vals.length - 1)) * (w - 8) + 4;
+        const y = h - (v / maxY) * (h - 20) - 10;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    // Initialize Fluent Sharp Grid Chart.js with offline Canvas fallback
     const chartCtx = document.getElementById("latencyChart").getContext("2d");
-    const chart = new Chart(chartCtx, {
-      type: "line",
-      data: {
-        labels: [],
-        datasets: [
-          {
-            label: "IPC Latency (µs)",
-            data: [],
-            borderColor: "#3B82F6",
-            backgroundColor: "rgba(59, 130, 246, 0.20)",
-            borderWidth: 2,
-            tension: 0,
-            fill: true,
-            pointRadius: 2,
-            pointBackgroundColor: []
+    const chart = (typeof Chart !== "undefined")
+      ? new Chart(chartCtx, {
+          type: "line",
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: "IPC Latency (µs)",
+                data: [],
+                borderColor: "#3B82F6",
+                backgroundColor: "rgba(59, 130, 246, 0.20)",
+                borderWidth: 2,
+                tension: 0,
+                fill: true,
+                pointRadius: 2,
+                pointBackgroundColor: []
+              },
+              {
+                label: "Budget Threshold (10,000 µs)",
+                data: [],
+                borderColor: "rgba(248, 113, 113, 0.75)",
+                borderDash: [5, 4],
+                borderWidth: 1.2,
+                pointRadius: 0,
+                fill: false
+              }
+            ]
           },
-          {
-            label: "Budget Threshold (10,000 µs)",
-            data: [],
-            borderColor: "rgba(248, 113, 113, 0.75)",
-            borderDash: [5, 4],
-            borderWidth: 1.2,
-            pointRadius: 0,
-            fill: false
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+              x: {
+                display: false,
+                grid: { color: "#2D2D2D" }
+              },
+              y: {
+                beginAtZero: true,
+                grid: { color: "#2D2D2D" },
+                ticks: { color: "#8A8A8A", font: { size: 11 } },
+                border: { display: false }
+              }
+            },
+            plugins: {
+              legend: { display: false }
+            }
           }
-        ]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        animation: false,
-        scales: {
-          x: {
-            display: false,
-            grid: { color: "#2D2D2D" }
+        })
+      : {
+          data: {
+            labels: [],
+            datasets: [
+              { borderColor: "#3B82F6", backgroundColor: "rgba(59,130,246,0.20)", data: [], pointBackgroundColor: [] },
+              { data: [] }
+            ]
           },
-          y: {
-            beginAtZero: true,
-            grid: { color: "#2D2D2D" },
-            ticks: { color: "#8A8A8A", font: { size: 11 } },
-            border: { display: false }
-          }
-        },
-        plugins: {
-          legend: { display: false }
-        }
-      }
-    });
+          resize() { drawOfflineChart(chartCtx, this.data); },
+          update() { drawOfflineChart(chartCtx, this.data); }
+        };
 
     function toggleRail() {
       document.getElementById("left-rail").classList.toggle("rail-collapsed");
@@ -744,7 +803,8 @@
     function filterBySearch(threads, pid) {
       if (!searchQuery) return threads;
       return threads.filter(t => {
-        const hay = `${pid || ""} tid ${t.tid} p${t.priority} ${t.state_name} ${t.ip_hex}`.toLowerCase();
+        const fnName = resolvedFnByIp.get(String(t.ip_hex || "").toLowerCase()) || "";
+        const hay = `${pid || ""} tid ${t.tid} p${t.priority} ${t.state_name} ${t.ip_hex} ${fnName}`.toLowerCase();
         return hay.includes(searchQuery);
       });
     }
@@ -763,11 +823,65 @@
       } catch (_) {}
     }
 
+    function populateTargetSelect(targets, defaultTarget) {
+      const sel = document.getElementById("target-select");
+      const prev = sel.value;
+      const items = (targets && targets.length) ? targets : ["brake_sim_buggy", "brake_sim_fixed"];
+      sel.innerHTML = items
+        .map(t => `<option value="${escapeHtml(t)}" class="bg-[#202020] text-white">${escapeHtml(t)}</option>`)
+        .join("");
+      sel.value = items.includes(prev) ? prev : (items.includes(defaultTarget) ? defaultTarget : items[0]);
+      document.getElementById("spec-target").textContent = sel.value;
+      document.getElementById("perf-sub-core0").textContent = sel.value;
+    }
+
+    async function loadTargetConfig() {
+      try {
+        const res = await fetch("/api/config");
+        const cfg = await res.json();
+        document.getElementById("cfg-target-dir").value = cfg.target_dir || "";
+        populateTargetSelect(cfg.targets, cfg.default_target);
+        document.getElementById("cfg-dir-msg").textContent =
+          cfg.targets?.length ? `Terdeteksi ${cfg.targets.length} binary ELF di folder aktif.` : "Belum ada binary ELF terdeteksi di folder ini.";
+        document.getElementById("cfg-dir-msg").className = "text-[11px] text-[#8A8A8A] min-h-[16px]";
+      } catch (_) {}
+    }
+
+    async function applyTargetDir() {
+      const input = document.getElementById("cfg-target-dir");
+      const msgEl = document.getElementById("cfg-dir-msg");
+      const targetDir = input.value.trim();
+      if (!targetDir) {
+        msgEl.textContent = "Folder target tidak boleh kosong.";
+        msgEl.className = "text-[11px] text-[#F87171] min-h-[16px]";
+        return;
+      }
+      try {
+        const res = await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_dir: targetDir })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Gagal mengubah folder target");
+        populateTargetSelect(data.targets, data.default_target);
+        msgEl.textContent = data.targets?.length
+          ? `✓ Aktif (${data.targets.length} ELF: ${data.targets.join(", ")})`
+          : "✓ Folder diperbarui (belum ada binary ELF di dalamnya).";
+        msgEl.className = "text-[11px] text-[#6CCB5F] min-h-[16px]";
+        onTargetChange();
+      } catch (err) {
+        msgEl.textContent = `Error: ${err.message}`;
+        msgEl.className = "text-[11px] text-[#F87171] min-h-[16px]";
+      }
+    }
+
     function renderPerformanceView(s, displayThreads) {
       const targetName = document.getElementById("target-select").value;
+      const liveCount = (s.threads && s.threads.length) ? s.threads.length : 0;
       document.getElementById("spec-target").textContent = targetName;
       document.getElementById("kpi-pid").textContent = s.active_pid || "—";
-      document.getElementById("kpi-threads").textContent = displayThreads.length;
+      document.getElementById("kpi-threads").textContent = liveCount;
       document.getElementById("kpi-packets").textContent = s.total_packets.toLocaleString();
       document.getElementById("kpi-anomalies").textContent = s.anomaly_count.toLocaleString();
 
@@ -778,9 +892,15 @@
         : "text-[20px] font-semibold text-[#4CC2FF] tnum mt-0.5";
 
       const healthEl = document.getElementById("kpi-health");
-      if (s.is_anomaly) {
-        const reasonState = s.last_anomaly?.state_name || "ANOMALY";
-        healthEl.textContent = `ANOMALY DETECTED (${reasonState})`;
+      if (s.total_packets > 0 && liveCount === 0) {
+        healthEl.textContent = s.is_anomaly ? "LAST RUN ANOMALY (TARGET STOPPED)" : "TARGET STOPPED / IDLE";
+        healthEl.className = s.is_anomaly
+          ? "text-[14px] font-semibold text-[#FBBF24] mt-0.5"
+          : "text-[14px] font-semibold text-[#8A8A8A] mt-0.5";
+      } else if (s.is_anomaly) {
+        const anomLat = s.last_anomaly?.latency_us || 0;
+        const badgeReason = anomLat > 10000 ? "IPC > 10ms" : (s.last_anomaly?.state_name || "ANOMALY");
+        healthEl.textContent = `ANOMALY DETECTED (${badgeReason})`;
         healthEl.className = "text-[14px] font-semibold text-[#F87171] mt-0.5";
       } else if (s.total_packets > 0) {
         healthEl.textContent = "HEALTHY (REAL-TIME)";
@@ -794,7 +914,7 @@
         ? `${s.peak_latency_us.toLocaleString()} µs • ${s.is_anomaly ? "Anomaly" : "Healthy"}`
         : "0 µs • Waiting";
       document.getElementById("perf-sub-core0").textContent = targetName;
-      document.getElementById("perf-sub-core1").textContent = s.total_packets > 0 ? `${displayThreads.length} threads • 100ms` : "100ms • /proc/as";
+      document.getElementById("perf-sub-core1").textContent = s.total_packets > 0 ? `${liveCount} live / ${displayThreads.length} seen • 100ms` : "100ms • /proc/as";
       document.getElementById("perf-sub-health").textContent = `${s.anomaly_count} anomalies • ${s.total_packets} pkts`;
 
       const hist = (s.history || []).slice(-60);
@@ -819,8 +939,11 @@
 
     function renderThreadsView(s, displayThreads) {
       const pidLabel = s.active_pid || "<pid>";
+      const isLive = Boolean(s.threads && s.threads.length);
       document.getElementById("threads-group-hdr").textContent = s.active_pid
-        ? `Target PID ${s.active_pid} — /proc/${s.active_pid}/as (${displayThreads.length} Threads)`
+        ? (isLive
+            ? `Target PID ${s.active_pid} — /proc/${s.active_pid}/as (${displayThreads.length} Live Threads)`
+            : `Target PID ${s.active_pid} — Target Stopped (Last ${displayThreads.length} Threads Snapshot)`)
         : "Target Process (/proc/<pid>/as)";
       if (currentTab === "threads") {
         document.getElementById("page-title").textContent = `Threads (/proc/${pidLabel}/as)`;
@@ -957,7 +1080,7 @@
       const displayThreads = getDisplayThreads(s);
 
       // Update shell indicators
-      document.getElementById("nav-thread-count").textContent = displayThreads.length;
+      document.getElementById("nav-thread-count").textContent = (s.threads && s.threads.length) ? s.threads.length : 0;
       document.getElementById("nav-ai-badge").classList.toggle("hidden", !s.is_anomaly);
       document.getElementById("header-alert-chip").classList.toggle("hidden", !s.is_anomaly);
       if (s.is_anomaly) {
@@ -1003,11 +1126,22 @@
         if (!data.resolved) {
           badge.textContent = "Unresolved";
           badge.className = "text-[11px] mono px-2 py-0.5 rounded-[4px] bg-[#242424] border border-[#3D3D3D] text-[#FBBF24]";
+          document.getElementById("sym-content").classList.add("hidden");
+          const emptyEl = document.getElementById("sym-empty");
+          emptyEl.classList.remove("hidden");
+          emptyEl.textContent = `Unresolved (${ipHex}): ${cr.error || "Address outside target DWARF symbols"}`;
           return;
         }
 
         badge.textContent = "Mapped";
         badge.className = "text-[11px] mono px-2 py-0.5 rounded-[4px] bg-[#132B20] border border-[#245940] text-[#6CCB5F]";
+        if (cr.function) {
+          resolvedFnByIp.set(ipHex.toLowerCase(), cr.function);
+          if (searchQuery && latestSnapshot) {
+            renderThreadsView(latestSnapshot, getDisplayThreads(latestSnapshot));
+            renderTimelineView(latestSnapshot, getDisplayThreads(latestSnapshot), false);
+          }
+        }
 
         const fileName = (cr.file || "").split(/[/\\]/).pop();
         document.getElementById("sym-empty").classList.add("hidden");
@@ -1021,6 +1155,9 @@
           const srvFile = (srv.file || "").split(/[/\\]/).pop();
           document.getElementById("sym-server-hdr").textContent = `[SERVER PAIRED] ${srvFile}:${srv.line}`;
           document.getElementById("sym-server-code").textContent = sliceFocusedSnippet(srv.snippet, 1);
+        } else {
+          document.getElementById("sym-server-hdr").textContent = "[SERVER PAIRED] Tidak ada panggilan ChannelCreate() terdeteksi di folder target";
+          document.getElementById("sym-server-code").textContent = "";
         }
       } catch (_) {
         badge.textContent = "Error";
@@ -1051,6 +1188,7 @@
 
     function onTargetChange() {
       const target = document.getElementById("target-select").value;
+      resolvedFnByIp.clear();
       document.getElementById("spec-target").textContent = target;
       document.getElementById("perf-sub-core0").textContent = target;
       clearDiagnosisCards(
@@ -1183,6 +1321,7 @@
       manualIpOverride = null;
       lastFetchedSymbolKey = "";
       lastDiffPair = { before: "", after: "" };
+      resolvedFnByIp.clear();
 
       clearDiagnosisCards(
         "Belum ada diagnosis AI",
@@ -1192,7 +1331,9 @@
       document.getElementById("diff-empty").textContent = "Diff perbaikan kode C/C++ akan muncul setelah analisis AI dijalankan.";
 
       document.getElementById("sym-content").classList.add("hidden");
-      document.getElementById("sym-empty").classList.remove("hidden");
+      const emptyEl = document.getElementById("sym-empty");
+      emptyEl.textContent = "Menunggu instruction pointer (RIP) dari target QNX atau klik Caller IP di Tab Threads.";
+      emptyEl.classList.remove("hidden");
       document.getElementById("sym-badge").textContent = "Idle";
       document.getElementById("sym-badge").className = "text-[11px] mono px-2 py-0.5 rounded-[4px] bg-[#242424] border border-[#3D3D3D] text-[#8A8A8A]";
 
@@ -1201,6 +1342,7 @@
     }
 
     checkHealth();
+    loadTargetConfig();
     connectWS();
   </script>
 </body>

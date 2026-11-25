@@ -36,6 +36,8 @@ QNX_STATES: dict[int, str] = {
 
 BLOCKED_STATES = {6, 13}  # STATE_REPLY, STATE_MUTEX
 LATENCY_THRESHOLD_US = 10_000  # 10 ms real-time budget threshold
+MAX_QNX_PRIORITY = 255
+MAX_REASONABLE_LATENCY_US = 60_000_000  # 60s sanity bound against corrupt/wrapped telemetry
 
 
 @dataclass
@@ -51,10 +53,14 @@ class TelemetryPacket:
 
 
 def decode_packet(data: bytes) -> TelemetryPacket | None:
-    """Unpack a 27-byte little-endian binary packet from np_agent."""
+    """Unpack and validate a 27-byte little-endian binary packet from np_agent."""
     if len(data) != PACKET_SIZE:
         return None
     pid, tid, state, priority, latency_us, ip = struct.unpack(PACKET_FMT, data)
+    if pid == 0 or tid == 0 or state not in QNX_STATES:
+        return None
+    if priority > MAX_QNX_PRIORITY or latency_us > MAX_REASONABLE_LATENCY_US:
+        return None
     return TelemetryPacket(
         pid=pid,
         tid=tid,
@@ -148,7 +154,7 @@ class AnomalyDetector:
             "updated_at": pkt.timestamp,
         }
 
-        if pkt.latency_us > 0 or pkt.priority >= 20:
+        if pkt.latency_us > 0 or pkt.priority >= 20 or pkt_anomaly:
             self.history.append({
                 "ts": round(pkt.timestamp, 3),
                 "tid": pkt.tid,

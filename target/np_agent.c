@@ -70,6 +70,40 @@ static uint64_t get_fallback_ip(int proc_fd, pthread_t tid) {
     return greg.x86_64.rip;
 }
 
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static void fetch_exe_basename(int proc_fd, char *out, size_t out_sz) {
+    struct {
+        procfs_debuginfo info;
+        char path[256];
+    } dbg;
+    out[0] = '\0';
+    memset(&dbg, 0, sizeof(dbg));
+    if (devctl(proc_fd, DCMD_PROC_MAPDEBUG_BASE, &dbg, sizeof(dbg), NULL) == EOK && dbg.info.path[0]) {
+        snprintf(out, out_sz, "%s", path_basename(dbg.info.path));
+    }
+}
+
+/* Translate ASLR virtual IP back to ELF link offset for PIE binaries */
+static uint64_t normalize_pie_ip(int proc_fd, const char *exe_base, uint64_t raw_ip) {
+    if (proc_fd < 0 || raw_ip == 0 || !exe_base || !exe_base[0]) return raw_ip;
+    struct {
+        procfs_debuginfo info;
+        char path[256];
+    } dbg;
+    memset(&dbg, 0, sizeof(dbg));
+    dbg.info.vaddr = raw_ip;
+    if (devctl(proc_fd, DCMD_PROC_MAPDEBUG, &dbg, sizeof(dbg), NULL) == EOK &&
+        dbg.info.path[0] &&
+        strcmp(path_basename(dbg.info.path), exe_base) == 0) {
+        return dbg.info.vaddr;
+    }
+    return raw_ip;
+}
+
 int main(int argc, char *argv[]) {
     const char *host_ip = (argc >= 2) ? argv[1] : NP_HOST_IP;
     int udp_port = (argc >= 3) ? atoi(argv[2]) : NP_UDP_PORT;
@@ -110,6 +144,7 @@ int main(int argc, char *argv[]) {
     const np_shm_region_t *shm = NULL;
     pid_t active_pid = manual_pid;
     int proc_fd = -1;
+    char exe_base[128] = {0};
     uint8_t blocked_streak[NP_MAX_SLOTS] = {0};
     uint64_t total_sent = 0;
 
@@ -117,13 +152,14 @@ int main(int argc, char *argv[]) {
         if (!shm) {
             shm = attach_probe_shm();
         }
-        pid_t desired_pid = manual_pid ? manual_pid : (shm ? (pid_t)shm->target_pid : 0);
+        pid_t desired_pid = manual_pid ? manual_pid : (shm && shm->magic == NP_SHM_MAGIC ? (pid_t)shm->target_pid : 0);
 
         if (desired_pid <= 0) {
             if (proc_fd >= 0) {
                 close(proc_fd);
                 proc_fd = -1;
                 active_pid = 0;
+                exe_base[0] = '\0';
             }
             usleep(100000);
             continue;
@@ -144,13 +180,16 @@ int main(int argc, char *argv[]) {
             }
             active_pid = desired_pid;
             memset(blocked_streak, 0, sizeof(blocked_streak));
-            printf("[np_agent] Attached to target PID %d (/proc/%d/as)\n",
-                   (int)active_pid, (int)active_pid);
+            fetch_exe_basename(proc_fd, exe_base, sizeof(exe_base));
+            printf("[np_agent] Attached to target PID %d (/proc/%d/as, exe=%s)\n",
+                   (int)active_pid, (int)active_pid, exe_base[0] ? exe_base : "unknown");
         }
 
         uint64_t now_cycles = ClockCycles();
         pthread_t tid = 1;
         int found_any = 0;
+        int shm_matches_pid = (shm != NULL && shm->magic == NP_SHM_MAGIC &&
+                               shm->target_pid == (uint32_t)active_pid);
 
         while (g_running) {
             procfs_status st;
@@ -177,7 +216,7 @@ int main(int argc, char *argv[]) {
             pkt.instruction_pointer = st.ip;
 
             np_probe_slot_t slot;
-            if (read_slot_stable(shm, (uint32_t)st.tid, &slot)) {
+            if (shm_matches_pid && read_slot_stable(shm, (uint32_t)st.tid, &slot)) {
                 if (slot.in_flight && shm->cycles_per_sec > 0 && now_cycles >= slot.start_cycles) {
                     pkt.latency_us = ((now_cycles - slot.start_cycles) * 1000000ULL) / shm->cycles_per_sec;
                 } else {
@@ -191,6 +230,7 @@ int main(int argc, char *argv[]) {
                 uint64_t rip = get_fallback_ip(proc_fd, st.tid);
                 if (rip != 0) pkt.instruction_pointer = rip;
             }
+            pkt.instruction_pointer = normalize_pie_ip(proc_fd, exe_base, pkt.instruction_pointer);
 
             ssize_t n = sendto(sock, &pkt, sizeof(pkt), 0,
                                (struct sockaddr *)&dest, sizeof(dest));

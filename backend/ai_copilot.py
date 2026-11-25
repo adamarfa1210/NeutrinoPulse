@@ -63,22 +63,30 @@ def _has_active_fixed_priority_flag(snippet: str) -> bool:
 def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note: str) -> dict[str, Any]:
     """Deterministic QNX diagnostic fallback if no API key is configured or offline."""
     res = context.get("client_resolution", {})
-    client_loc = f"{res.get('file', 'unknown')}:{res.get('line', 0)}"
+    is_resolved = bool(res.get("resolved"))
+    client_loc = f"{res.get('file', 'unknown')}:{res.get('line', 0)}" if is_resolved else "unresolved symbol (outside target DWARF)"
     server_channels = context.get("server_channels", [])
     buggy_server = next((b for b in server_channels if _has_active_fixed_priority_flag(b["snippet"])), None)
     latency_us = int(anomaly.get("latency_us") or 0)
+    is_active_stall = latency_us > 10_000 or anomaly.get("state_name") in ("STATE_REPLY", "STATE_MUTEX")
 
     if buggy_server:
+        sev = "CRITICAL" if is_active_stall else "WARNING"
+        loc_suffix = f" (blocked at {client_loc})" if is_resolved else ""
+        detail = (
+            f"Thread prioritas tinggi (Prio {anomaly.get('priority')}) terhambat {latency_us} us di {client_loc}."
+            if is_active_stall
+            else f"Latensi terukur saat ini {latency_us} us (belum melewati 10,000 us), namun konfigurasi channel berisiko memicu Priority Inversion."
+        )
         return {
             "provider": f"fallback ({note})",
             "root_cause": "QNX IPC Priority Inversion via _NTO_CHF_FIXED_PRIORITY",
-            "severity": "CRITICAL",
+            "severity": sev,
             "qnx_explanation": (
-                f"Thread prioritas tinggi (Prio {anomaly.get('priority')}) terhambat {latency_us} us "
-                f"di {client_loc}. Channel server dibuat dengan flag _NTO_CHF_FIXED_PRIORITY yang mematikan "
-                f"Priority Inheritance bawaan kernel QNX Neutrino, sehingga server (Prio 10) disela oleh thread menengah."
+                f"{detail} Channel server dibuat dengan flag _NTO_CHF_FIXED_PRIORITY yang mematikan "
+                f"Priority Inheritance bawaan kernel QNX Neutrino, sehingga thread server tetap pada prioritas statis dan dapat disela thread menengah."
             ),
-            "file_location": f"{buggy_server['file']}:{buggy_server['line']} (blocked at {client_loc})",
+            "file_location": f"{buggy_server['file']}:{buggy_server['line']}{loc_suffix}",
             "code_before": "int chid = ChannelCreate(_NTO_CHF_FIXED_PRIORITY);",
             "code_after": "int chid = ChannelCreate(0); // Enable QNX kernel priority inheritance",
         }
@@ -96,6 +104,21 @@ def _rule_based_fallback(anomaly: dict[str, Any], context: dict[str, Any], note:
             "file_location": srv_loc,
             "code_before": "// No change needed (ChannelCreate(0) active)",
             "code_after": "// Real-time budget < 10,000 us verified healthy",
+        }
+
+    if not is_resolved:
+        return {
+            "provider": f"fallback ({note})",
+            "root_cause": f"Unresolved Symbol on Latency / Blocking ({anomaly.get('state_name')})",
+            "severity": "WARNING",
+            "qnx_explanation": (
+                f"Terdeteksi lonjakan/blokir {latency_us} us pada TID {anomaly.get('tid')} (Prio {anomaly.get('priority')}), "
+                f"tetapi IP ({anomaly.get('ip_hex', '0x0')}) tidak cocok dengan simbol DWARF target aktif ({res.get('error', '??:0')}). "
+                f"Pastikan Target Config mengarah ke ELF binary & folder source yang benar dengan flag -g."
+            ),
+            "file_location": client_loc,
+            "code_before": "// Target binary mismatch or missing -g debug info",
+            "code_after": "// Select matching ELF binary & source folder in Target Config",
         }
 
     return {

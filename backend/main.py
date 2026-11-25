@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 
 from dotenv import load_dotenv
@@ -13,47 +14,86 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ai_copilot import diagnose_anomaly
-from resolver import DEFAULT_ADDR2LINE, extract_code_context
+from resolver import DEFAULT_ADDR2LINE, HEX_IP_RE, compute_cache_stamp, extract_code_context, is_elf_file
 from telemetry import AnomalyDetector, decode_packet
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 UDP_PORT = int(os.getenv("UDP_PORT", "9999"))
-ADDR2LINE_EXE = os.getenv("QNX_ADDR2LINE", DEFAULT_ADDR2LINE)
-TARGET_DIR = os.getenv("TARGET_DIR", str(BASE_DIR.parent / "target"))
-DEFAULT_BINARY = os.getenv("TARGET_BINARY", str(Path(TARGET_DIR) / "brake_sim_buggy"))
+ADDR2LINE_EXE = os.getenv("QNX_ADDR2LINE", "").strip() or DEFAULT_ADDR2LINE
+TARGET_DIR = os.getenv("TARGET_DIR", "").strip() or str(BASE_DIR.parent / "target")
+DEFAULT_BINARY = os.getenv("TARGET_BINARY", "").strip() or str(Path(TARGET_DIR) / "brake_sim_buggy")
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
 detector = AnomalyDetector()
 ws_clients: set[WebSocket] = set()
-_ALLOWED_TARGETS = {"brake_sim_buggy", "brake_sim_fixed"}
-_symbol_cache: dict[tuple[str, str], dict[str, Any]] = {}
+_SOURCE_IMPL_EXTS = {".c", ".cpp", ".cc", ".cxx"}
+_runtime_cfg: dict[str, str] = {
+    "target_dir": TARGET_DIR,
+    "default_binary": DEFAULT_BINARY,
+}
+_symbol_cache: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+
+
+def _list_elf_targets(target_dir: str) -> list[str]:
+    root = Path(target_dir)
+    if not root.is_dir():
+        return []
+    found = [
+        p.name for p in sorted(root.iterdir())
+        if p.name != "np_agent" and is_elf_file(p)
+    ]
+    return found
 
 
 def _resolve_target_binary(target: str | None = None, binary_path: str | None = None) -> str:
-    if target and target in _ALLOWED_TARGETS:
-        candidate = Path(TARGET_DIR) / target
-        if candidate.is_file():
-            return str(candidate)
+    active_dir = _runtime_cfg["target_dir"]
+    target_root = Path(active_dir).resolve()
+    if target:
+        clean_name = target.strip()
+        if clean_name and Path(clean_name).name == clean_name:
+            candidate = (target_root / clean_name).resolve()
+            if target_root in candidate.parents and is_elf_file(candidate):
+                return str(candidate)
     if binary_path:
-        return binary_path
-    return DEFAULT_BINARY
+        try:
+            resolved = Path(binary_path).resolve(strict=True)
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid binary_path: {exc}") from exc
+        if target_root not in resolved.parents or not is_elf_file(resolved):
+            raise HTTPException(status_code=400, detail="binary_path must be an ELF file inside configured TARGET_DIR")
+        return str(resolved)
+    return _runtime_cfg["default_binary"]
 
 
 def _get_code_context(ip_hex: str, binary_path: str) -> dict[str, Any]:
-    cache_key = (ip_hex.lower(), binary_path)
+    active_dir = _runtime_cfg["target_dir"]
+    bin_mtime, src_mtime = compute_cache_stamp(binary_path, active_dir)
+    cache_key = (ip_hex.lower(), binary_path, bin_mtime, src_mtime)
     if cache_key not in _symbol_cache:
         ctx = extract_code_context(
             ip_hex=ip_hex,
-            target_dir=TARGET_DIR,
+            target_dir=active_dir,
             binary_path=binary_path,
             addr2line_exe=ADDR2LINE_EXE,
         )
-        stem_c = f"{Path(binary_path).stem}.c"
+        stem = Path(binary_path).stem
         channels = list(ctx.get("server_channels") or [])
-        matching = [ch for ch in channels if Path(ch.get("file", "")).name == stem_c]
-        ctx["server_channels"] = matching or channels
+        matching = [
+            ch for ch in channels
+            if Path(ch.get("file", "")).stem == stem
+            and Path(ch.get("file", "")).suffix.lower() in _SOURCE_IMPL_EXTS
+        ]
+        if matching:
+            ctx["server_channels"] = matching
+        elif not stem.startswith("brake_sim"):
+            ctx["server_channels"] = [
+                ch for ch in channels
+                if not Path(ch.get("file", "")).name.startswith("brake_sim_")
+            ]
+        else:
+            ctx["server_channels"] = channels
         if len(_symbol_cache) >= 64:
             _symbol_cache.clear()
         _symbol_cache[cache_key] = ctx
@@ -101,8 +141,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="NeutrinoPulse QNX Telemetry & AI Copilot", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origin_regex=r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$",
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -113,6 +153,44 @@ class DiagnoseRequest(BaseModel):
     target: str | None = None
 
 
+class ConfigUpdateRequest(BaseModel):
+    target_dir: str
+
+
+@app.get("/api/config")
+async def get_config() -> dict[str, Any]:
+    targets = _list_elf_targets(_runtime_cfg["target_dir"])
+    default_name = Path(_runtime_cfg["default_binary"]).name
+    if targets and default_name not in targets:
+        default_name = targets[0]
+    return {
+        "target_dir": _runtime_cfg["target_dir"],
+        "targets": targets,
+        "default_target": default_name,
+    }
+
+
+@app.post("/api/config")
+async def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
+    raw_dir = req.target_dir.strip()
+    if not raw_dir:
+        raise HTTPException(status_code=400, detail="target_dir must not be empty")
+    try:
+        resolved_dir = Path(raw_dir).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid target_dir: {exc}") from exc
+    if not resolved_dir.is_dir():
+        raise HTTPException(status_code=400, detail="target_dir must be an existing directory")
+
+    _runtime_cfg["target_dir"] = str(resolved_dir)
+    targets = _list_elf_targets(str(resolved_dir))
+    if targets:
+        preferred = "brake_sim_buggy" if "brake_sim_buggy" in targets else targets[0]
+        _runtime_cfg["default_binary"] = str(resolved_dir / preferred)
+    _symbol_cache.clear()
+    return await get_config()
+
+
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -121,7 +199,7 @@ async def health() -> dict[str, Any]:
         "udp_port": UDP_PORT,
         "llm_provider": os.getenv("LLM_PROVIDER", "gemini"),
         "gemini_configured": bool(api_key and api_key != "your_gemini_api_key_here"),
-        "addr2line_available": Path(ADDR2LINE_EXE).is_file(),
+        "addr2line_available": bool(Path(ADDR2LINE_EXE).is_file() or shutil.which(ADDR2LINE_EXE)),
     }
 
 
@@ -133,12 +211,16 @@ async def get_state() -> dict[str, Any]:
 @app.post("/api/reset")
 async def reset_state() -> dict[str, str]:
     detector.reset()
+    _symbol_cache.clear()
     return {"status": "reset"}
 
 
 @app.get("/api/symbol")
 async def resolve_symbol_endpoint(ip_hex: str | None = None, target: str | None = None) -> dict[str, Any]:
-    resolved_ip = ip_hex
+    if ip_hex is not None and ip_hex.strip():
+        if not HEX_IP_RE.fullmatch(ip_hex.strip()):
+            raise HTTPException(status_code=400, detail="Invalid ip_hex format (expected 0x... hex)")
+    resolved_ip = ip_hex.strip() if ip_hex and ip_hex.strip() else None
     if not resolved_ip and detector.last_anomaly:
         resolved_ip = detector.last_anomaly.get("ip_hex")
     if not resolved_ip:
@@ -161,13 +243,14 @@ async def resolve_symbol_endpoint(ip_hex: str | None = None, target: str | None 
     binary_path = _resolve_target_binary(target=target)
     ctx = _get_code_context(resolved_ip, binary_path)
     channels = ctx.get("server_channels") or []
+    is_resolved = bool(ctx.get("client_resolution", {}).get("resolved"))
     return {
-        "resolved": bool(ctx.get("client_resolution", {}).get("resolved")),
+        "resolved": is_resolved,
         "ip_hex": resolved_ip,
         "target_binary": Path(binary_path).name,
         "client_resolution": ctx.get("client_resolution", {"resolved": False}),
         "client_snippet": ctx.get("client_snippet", ""),
-        "server_channel": channels[0] if channels else None,
+        "server_channel": channels[0] if (channels and is_resolved) else None,
     }
 
 
@@ -199,7 +282,10 @@ async def run_diagnosis(req: DiagnoseRequest | None = None) -> dict[str, Any]:
         else:
             raise HTTPException(status_code=400, detail="No telemetry or anomaly detected yet to diagnose.")
 
-    ip_hex = (req.ip_hex if req and req.ip_hex else None) or anomaly.get("ip_hex", "0x0")
+    if req and req.ip_hex and req.ip_hex.strip():
+        if not HEX_IP_RE.fullmatch(req.ip_hex.strip()):
+            raise HTTPException(status_code=400, detail="Invalid ip_hex format (expected 0x... hex)")
+    ip_hex = (req.ip_hex.strip() if req and req.ip_hex and req.ip_hex.strip() else None) or anomaly.get("ip_hex", "0x0")
     binary_path = _resolve_target_binary(
         target=req.target if req else None,
         binary_path=req.binary_path if req else None,

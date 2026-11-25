@@ -24,7 +24,8 @@ static __attribute__((noinline)) uint64_t np_get_caller_ip(void) {
 }
 
 static inline int np_probe_init(void) {
-    int fd = shm_open(NP_SHM_NAME, O_RDWR | O_CREAT, 0666);
+    /* ponytail: single global /np_probe_shm assumes one instrumented PID at a time; upgrade to per-PID SHM for multi-process IPC. */
+    int fd = shm_open(NP_SHM_NAME, O_RDWR | O_CREAT, 0640);
     if (fd < 0) {
         perror("np_probe: shm_open");
         return -1;
@@ -42,6 +43,8 @@ static inline int np_probe_init(void) {
     }
 
     g_np_shm = (np_shm_region_t *)ptr;
+    g_np_shm->magic = 0;
+    __sync_synchronize();
     memset((void *)g_np_shm, 0, sizeof(np_shm_region_t));
     g_np_shm->cycles_per_sec = SYSPAGE_ENTRY(qtime)->cycles_per_sec;
     g_np_shm->target_pid = (uint32_t)getpid();

@@ -57,17 +57,22 @@ To solve this, [`target/np_probe.h`](target/np_probe.h) wraps `MsgSend()` with a
 3. A lock-free sequence counter (`seq`: odd = writing, even = stable) in POSIX shared memory (`/np_probe_shm`), so the real-time thread on Core 0 never acquires a mutex or blocks on IPC.
 
 ```c
-__attribute__((noinline))
-static long np_msgsend_probe(int coid, const void *smsg, size_t sbytes,
-                             void *rmsg, size_t rbytes) {
-    uint64_t caller_ip = (uint64_t)(uintptr_t)__builtin_return_address(0);
-    uint64_t start = ClockCycles();
-    /* Write start + caller_ip to lock-free /np_probe_shm slot */
+static __attribute__((noinline)) uint64_t np_get_caller_ip(void) {
+    return (uint64_t)(uintptr_t)__builtin_return_address(0);
+}
+
+static inline long np_msgsend_traced(int coid, const void *smsg, size_t sbytes,
+                                     void *rmsg, size_t rbytes, uint64_t caller_ip) {
+    uint64_t t_start = ClockCycles();
+    /* Write start_cycles + caller_ip + in_flight=1 to lock-free /np_probe_shm slot */
     long rc = MsgSend(coid, smsg, sbytes, rmsg, rbytes);
-    uint64_t end = ClockCycles();
-    /* Convert (end - start) cycles to microseconds */
+    uint64_t t_end = ClockCycles();
+    /* Convert (t_end - t_start) cycles to microseconds */
     return rc;
 }
+
+#define NP_MSGSEND(coid, smsg, sbytes, rmsg, rbytes) \
+    np_msgsend_traced((coid), (smsg), (sbytes), (rmsg), (rbytes), np_get_caller_ip())
 ```
 
 > **Important:** Compile with `-g -fno-pie -no-pie` in [`target/Makefile`](target/Makefile) so virtual addresses match ELF DWARF debug offsets cleanly in `ntox86_64-addr2line`.
